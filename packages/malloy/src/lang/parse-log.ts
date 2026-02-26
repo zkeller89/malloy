@@ -422,6 +422,8 @@ type MessageParameterTypes = {
   'missing-required-group-by': string;
   'invalid-partition-composite': string;
   'integer-literal-out-of-range': string;
+  'spine-date-on-dimension': string;
+  'spine-group-on-measure': string;
 };
 
 export const MESSAGE_FORMATTERS: PartialErrorCodeMessageMap = {
