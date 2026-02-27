@@ -428,7 +428,6 @@ type MessageParameterTypes = {
   'spine-missing-end': string;
   'spine-start-must-be-temporal': string;
   'spine-end-must-be-temporal': string;
-  'invalid-source-from-spine': string;
 };
 
 export const MESSAGE_FORMATTERS: PartialErrorCodeMessageMap = {

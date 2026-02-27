@@ -1990,7 +1990,13 @@ export class MalloyToAST
 
   visitSQID(pcx: parse.SQIDContext) {
     const ref = this.getModelEntryName(pcx);
-    const args = this.getSQArguments(pcx.sourceArguments());
+    // Parse arguments directly (no experiment gate) — passing arguments to
+    // a parameterized source is required for spine sources and is harmless
+    // for any other source that declares parameters.
+    const argsCx = pcx.sourceArguments();
+    const args = argsCx
+      ? argsCx.sourceArgument().map(arg => this.getSQArgument(arg))
+      : undefined;
     return this.astAt(new ast.SQReference(ref, args), pcx.id());
   }
 

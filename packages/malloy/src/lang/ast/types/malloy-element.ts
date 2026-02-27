@@ -34,7 +34,7 @@ import type {
   SourceRegistryValue,
   StructDef,
 } from '../../../model/malloy_types';
-import {isSourceDef, isSpineSourceDef, isPersistableSourceDef} from '../../../model/malloy_types';
+import {isSourceDef, isPersistableSourceDef} from '../../../model/malloy_types';
 import {mkModelDef} from '../../../model/utils';
 import {Tag} from '@malloydata/malloy-tag';
 import type {
@@ -541,7 +541,6 @@ export class Document extends MalloyElement implements NameSpace {
         const entry = {...orig};
         if (
           isSourceDef(entry) ||
-          isSpineSourceDef(entry) ||
           entry.type === 'query' ||
           entry.type === 'function'
         ) {
@@ -606,7 +605,7 @@ export class Document extends MalloyElement implements NameSpace {
     }
     for (const [name, modelEntry] of this.documentModel) {
       const entryDef = modelEntry.entry;
-      if (isSourceDef(entryDef) || isSpineSourceDef(entryDef) || entryDef.type === 'query') {
+      if (isSourceDef(entryDef) || entryDef.type === 'query') {
         if (modelEntry.exported) {
           def.exports.push(name);
         }
@@ -634,7 +633,7 @@ export class Document extends MalloyElement implements NameSpace {
         `Cannot redefine '${str}', which is in global namespace`
       );
     }
-    if (isSourceDef(ent.entry)) {
+    if (isSourceDef(ent.entry) && ent.entry.dialect) {
       this.checkExperimentalDialect(this, ent.entry.dialect);
     }
 

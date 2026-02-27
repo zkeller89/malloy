@@ -1387,12 +1387,10 @@ export interface CompositeSourceDef extends SourceDefBase {
  * connection/dialect are intentionally omitted here; they are resolved
  * when the spine is used in a query.
  */
-export interface SpineSourceDef extends StructDefBase {
+export interface SpineSourceDef extends SourceDefBase {
   type: 'spine';
   spineStart: Expr;
   spineEnd: Expr;
-  /** Declared parameters (e.g. grain::string). Resolved at query time. */
-  parameters?: SafeRecord<Parameter>;
 }
 
 /*
@@ -1503,7 +1501,8 @@ export function isSourceDef(sd: NamedModelObject | FieldDef): sd is SourceDef {
     sd.type === 'query_result' ||
     sd.type === 'finalize' ||
     sd.type === 'nest_source' ||
-    sd.type === 'composite'
+    sd.type === 'composite' ||
+    sd.type === 'spine'
   );
 }
 
@@ -1531,7 +1530,8 @@ export type SourceDef =
   | QueryResultDef
   | FinalizeSourceDef
   | NestSourceDef
-  | CompositeSourceDef;
+  | CompositeSourceDef
+  | SpineSourceDef;
 
 /** Sources that can be persisted (materialized to tables) */
 export type PersistableSourceDef = SQLSourceDef | QuerySourceDef;

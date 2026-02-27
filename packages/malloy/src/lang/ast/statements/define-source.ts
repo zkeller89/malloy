@@ -209,6 +209,9 @@ export class DefineSpineSource
       name: this.name,
       fields: [mkFieldDef({type: 'timestamp'}, 'spine_date')],
       location: this.location,
+      // connection/dialect are not known at definition time; resolved at query time
+      connection: '',
+      dialect: '',
       spineStart: startVal.value,
       spineEnd: endVal.value,
     };

@@ -135,16 +135,10 @@ export class NamedSource extends Source {
         `Cannot construct a source from a connection '${this.refName}'`
       );
       return;
-    } else if (entry.type === 'spine') {
-      // Spine sources cannot be used as a base source expression yet;
-      // SQL generation for spine sources is deferred.
-      this.logError(
-        'invalid-source-from-spine',
-        `Cannot use spine_source '${this.refName}' as a source expression`
-      );
-      return;
     } else {
-      this.document()?.checkExperimentalDialect(this, entry.dialect);
+      if (isSourceDef(entry) && entry.dialect) {
+        this.document()?.checkExperimentalDialect(this, entry.dialect);
+      }
       if (isSourceDef(entry)) {
         return {...entry};
       }
