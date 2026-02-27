@@ -30,6 +30,7 @@ import type {
 import {
   isPersistableSourceDef,
   isTemporalType,
+  mkFieldDef,
   mkSafeRecord,
 } from '../../../model/malloy_types';
 import type {ConstantExpression} from '../expressions/constant-expression';
@@ -206,7 +207,7 @@ export class DefineSpineSource
     const entry: SpineSourceDef = {
       type: 'spine',
       name: this.name,
-      fields: [],
+      fields: [mkFieldDef({type: 'timestamp'}, 'spine_date')],
       location: this.location,
       spineStart: startVal.value,
       spineEnd: endVal.value,
