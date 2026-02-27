@@ -27,6 +27,11 @@ import type {ParseTree, TerminalNode} from 'antlr4ts/tree';
 import {AbstractParseTreeVisitor} from 'antlr4ts/tree/AbstractParseTreeVisitor';
 import type {MalloyParserVisitor} from './lib/Malloy/MalloyParserVisitor';
 import type * as parse from './lib/Malloy/MalloyParser';
+import {
+  SpineStartContext,
+  SpineEndContext,
+  SpineGrainContext,
+} from './lib/Malloy/MalloyParser';
 import * as ast from './ast';
 import type {
   LogMessageOptions,
@@ -61,9 +66,11 @@ import {
   isBasicAtomicType,
   isMatrixOperation,
   isParameterType,
+  isTimestampUnit,
   mkFieldDef,
   mkArrayTypeDef,
 } from '../model/malloy_types';
+import type {TimestampUnit} from '../model/malloy_types';
 import type {Tag} from '@malloydata/malloy-tag';
 import {parseTag} from '@malloydata/malloy-tag';
 import {isNotUndefined, rangeFromContext} from './utils';
@@ -390,6 +397,54 @@ export class MalloyToAST
     const defList = new ast.DefineSourceList(defs);
     defList.extendNote({blockNotes});
     return defList;
+  }
+
+  visitDefineSpineSourceStatement(
+    pcx: parse.DefineSpineSourceStatementContext
+  ): ast.DefineSpineSourceList {
+    const defsCx = pcx.spineSourcePropertyList().spineSourceDefinition();
+    const defs = defsCx.map(dcx => this.visitSpineSourceDefinition(dcx));
+    const blockNotes = this.getNotes(pcx.tags());
+    const defList = new ast.DefineSpineSourceList(defs);
+    defList.extendNote({blockNotes});
+    return defList;
+  }
+
+  visitSpineSourceDefinition(
+    pcx: parse.SpineSourceDefinitionContext
+  ): ast.DefineSpineSource {
+    let startExpr: ast.ConstantExpression | undefined;
+    let endExpr: ast.ConstantExpression | undefined;
+    let grain: TimestampUnit | undefined;
+
+    for (const prop of pcx.spineBody().spineProperty()) {
+      if (prop instanceof SpineStartContext) {
+        startExpr = this.astAt(
+          new ast.ConstantExpression(this.getFieldExpr(prop.fieldExpr())),
+          prop.fieldExpr()
+        );
+      } else if (prop instanceof SpineEndContext) {
+        endExpr = this.astAt(
+          new ast.ConstantExpression(this.getFieldExpr(prop.fieldExpr())),
+          prop.fieldExpr()
+        );
+      } else if (prop instanceof SpineGrainContext) {
+        const raw = prop.timeframe().text.toLowerCase();
+        // Lexer tokens allow optional plural 's' (e.g. "days"), strip it
+        const normalized = raw.endsWith('s') ? raw.slice(0, -1) : raw;
+        grain = isTimestampUnit(normalized) ? normalized : undefined;
+      }
+    }
+
+    const spineDef = new ast.DefineSpineSource(
+      getId(pcx.sourceNameDef()),
+      true,
+      startExpr,
+      endExpr,
+      grain
+    );
+    spineDef.extendNote({notes: this.getNotes(pcx.tags())});
+    return this.astAt(spineDef, pcx);
   }
 
   getSourceParameter(

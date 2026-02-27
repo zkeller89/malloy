@@ -1381,6 +1381,19 @@ export interface CompositeSourceDef extends SourceDefBase {
   sources: SourceDef[];
 }
 
+/**
+ * A synthetic date spine source. Unlike other source types, it does not
+ * reference a table or SQL — the rows are generated at query time.
+ * connection/dialect are intentionally omitted here; they are resolved
+ * when the spine is used in a query.
+ */
+export interface SpineSourceDef extends StructDefBase {
+  type: 'spine';
+  spineStart: Expr;
+  spineEnd: Expr;
+  spineGrain: TimestampUnit;
+}
+
 /*
  * Malloy has a kind of "strings" which is a list of segments. Each segment
  * is either a string, or a query, which is meant to be replaced
@@ -1491,6 +1504,12 @@ export function isSourceDef(sd: NamedModelObject | FieldDef): sd is SourceDef {
     sd.type === 'nest_source' ||
     sd.type === 'composite'
   );
+}
+
+export function isSpineSourceDef(
+  sd: NamedModelObject | FieldDef
+): sd is SpineSourceDef {
+  return sd.type === 'spine';
 }
 
 /**
@@ -1825,6 +1844,7 @@ export function getIdentifier(n: AliasedName): string {
 
 export type NamedModelObject =
   | SourceDef
+  | SpineSourceDef
   | NamedQueryDef
   | FunctionDef
   | ConnectionDef;
