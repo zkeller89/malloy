@@ -30,6 +30,10 @@ import type {
   UniqueKeyRequirement,
   Query,
   PrepareResultOptions,
+  SpineSourceDef,
+  DateLiteralNode,
+  TimestampLiteralNode,
+  StringLiteralNode,
 } from './malloy_types';
 import {
   isRawSegment,
@@ -829,6 +833,21 @@ export class QueryQuery extends QueryField {
           qs.parent !== undefined
         );
         return ret.lastStageName;
+      }
+      case 'spine': {
+        const def = qs.structDef as SpineSourceDef;
+        // Extract literal values from the spineStart / spineEnd IR expressions.
+        const startNode = def.spineStart as
+          | DateLiteralNode
+          | TimestampLiteralNode;
+        const endNode = def.spineEnd as DateLiteralNode | TimestampLiteralNode;
+        const start = startNode.literal;
+        const end = endNode.literal;
+        // Grain comes from the resolved sourceArguments (e.g. grain is 'day').
+        const grainArg = qs.structDef.arguments?.['grain'];
+        const grainNode = grainArg?.value as StringLiteralNode | null;
+        const grain = grainNode?.literal ?? 'day';
+        return this.parent.dialect.sqlDateSpine(start, end, grain);
       }
       default:
         throw new Error(

@@ -117,6 +117,11 @@ export class DuckDBDialect extends PostgresBase {
     return tableName.match(/[/*:;-]/) ? `'${tableName}'` : tableName;
   }
 
+  sqlDateSpine(start: string, end: string, grain: string): string {
+    const interval = grain.toUpperCase();
+    return `(SELECT generate_series AS spine_date FROM generate_series(TIMESTAMP '${start}', TIMESTAMP '${end}', INTERVAL 1 ${interval}))`;
+  }
+
   sqlGroupSetTable(groupSetCount: number): string {
     return `CROSS JOIN (SELECT UNNEST(GENERATE_SERIES(0,${groupSetCount},1)) as group_set  ) as group_set`;
   }
