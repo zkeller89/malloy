@@ -30,7 +30,6 @@ import type * as parse from './lib/Malloy/MalloyParser';
 import {
   SpineStartContext,
   SpineEndContext,
-  SpineGrainContext,
 } from './lib/Malloy/MalloyParser';
 import * as ast from './ast';
 import type {
@@ -66,11 +65,9 @@ import {
   isBasicAtomicType,
   isMatrixOperation,
   isParameterType,
-  isTimestampUnit,
   mkFieldDef,
   mkArrayTypeDef,
 } from '../model/malloy_types';
-import type {TimestampUnit} from '../model/malloy_types';
 import type {Tag} from '@malloydata/malloy-tag';
 import {parseTag} from '@malloydata/malloy-tag';
 import {isNotUndefined, rangeFromContext} from './utils';
@@ -415,7 +412,6 @@ export class MalloyToAST
   ): ast.DefineSpineSource {
     let startExpr: ast.ConstantExpression | undefined;
     let endExpr: ast.ConstantExpression | undefined;
-    let grain: TimestampUnit | undefined;
 
     for (const prop of pcx.spineBody().spineProperty()) {
       if (prop instanceof SpineStartContext) {
@@ -428,20 +424,24 @@ export class MalloyToAST
           new ast.ConstantExpression(this.getFieldExpr(prop.fieldExpr())),
           prop.fieldExpr()
         );
-      } else if (prop instanceof SpineGrainContext) {
-        const raw = prop.timeframe().text.toLowerCase();
-        // Lexer tokens allow optional plural 's' (e.g. "days"), strip it
-        const normalized = raw.endsWith('s') ? raw.slice(0, -1) : raw;
-        grain = isTimestampUnit(normalized) ? normalized : undefined;
       }
     }
 
+    // Collect parameters directly (spine_source params are not behind the
+    // 'parameters' experiment flag — they are integral to the feature).
+    const paramsCx = pcx.sourceParameters();
+    const params: ast.HasParameter[] = paramsCx
+      ? paramsCx
+          .sourceParameter()
+          .map(p => this.getSourceParameter(p))
+          .filter((p): p is ast.HasParameter => p !== null)
+      : [];
     const spineDef = new ast.DefineSpineSource(
       getId(pcx.sourceNameDef()),
       true,
       startExpr,
       endExpr,
-      grain
+      params.length > 0 ? params : undefined
     );
     spineDef.extendNote({notes: this.getNotes(pcx.tags())});
     return this.astAt(spineDef, pcx);

@@ -23,11 +23,15 @@
 
 import type {
   Annotation,
+  Parameter,
   SpineSourceDef,
   StructDef,
-  TimestampUnit,
 } from '../../../model/malloy_types';
-import {isPersistableSourceDef, isTemporalType} from '../../../model/malloy_types';
+import {
+  isPersistableSourceDef,
+  isTemporalType,
+  mkSafeRecord,
+} from '../../../model/malloy_types';
 import type {ConstantExpression} from '../expressions/constant-expression';
 import {mkSourceID} from '../../../model/source_def_utils';
 import {ErrorFactory} from '../error-factory';
@@ -159,11 +163,12 @@ export class DefineSpineSource
     readonly exported: boolean,
     readonly startExpr?: ConstantExpression,
     readonly endExpr?: ConstantExpression,
-    readonly grain?: TimestampUnit
+    readonly parameters?: HasParameter[]
   ) {
     super();
     if (startExpr) this.has({startExpr});
     if (endExpr) this.has({endExpr});
+    if (parameters) this.has({parameters});
   }
 
   execute(doc: Document): void {
@@ -180,10 +185,6 @@ export class DefineSpineSource
     }
     if (!this.endExpr) {
       this.logError('spine-missing-end', 'spine_source requires an end: property');
-      return;
-    }
-    if (this.grain === undefined) {
-      this.logError('spine-missing-grain', 'spine_source requires a grain: property');
       return;
     }
     const startVal = this.startExpr.constantValue();
@@ -209,8 +210,14 @@ export class DefineSpineSource
       location: this.location,
       spineStart: startVal.value,
       spineEnd: endVal.value,
-      spineGrain: this.grain,
     };
+    if (this.parameters && this.parameters.length > 0) {
+      const params = mkSafeRecord<Parameter>();
+      for (const p of this.parameters) {
+        params[p.name] = p.parameter();
+      }
+      entry.parameters = params;
+    }
     if (this.note) {
       entry.annotation = this.note;
     }

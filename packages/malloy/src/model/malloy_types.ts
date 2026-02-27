@@ -1391,7 +1391,8 @@ export interface SpineSourceDef extends StructDefBase {
   type: 'spine';
   spineStart: Expr;
   spineEnd: Expr;
-  spineGrain: TimestampUnit;
+  /** Declared parameters (e.g. grain::string). Resolved at query time. */
+  parameters?: SafeRecord<Parameter>;
 }
 
 /*

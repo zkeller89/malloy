@@ -426,7 +426,6 @@ type MessageParameterTypes = {
   'spine-group-on-measure': string;
   'spine-missing-start': string;
   'spine-missing-end': string;
-  'spine-missing-grain': string;
   'spine-start-must-be-temporal': string;
   'spine-end-must-be-temporal': string;
   'invalid-source-from-spine': string;

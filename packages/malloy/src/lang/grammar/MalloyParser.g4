@@ -51,7 +51,7 @@ spineSourcePropertyList
   ;
 
 spineSourceDefinition
-  : tags sourceNameDef spineBody
+  : tags sourceNameDef sourceParameters? spineBody
   ;
 
 spineBody
@@ -61,7 +61,6 @@ spineBody
 spineProperty
   : SPINE_START fieldExpr    # spineStart
   | SPINE_END fieldExpr      # spineEnd
-  | SPINE_GRAIN timeframe    # spineGrain
   | ANNOTATION+              # spineAnnotation
   ;
 
