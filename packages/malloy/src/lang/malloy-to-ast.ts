@@ -27,6 +27,10 @@ import type {ParseTree, TerminalNode} from 'antlr4ts/tree';
 import {AbstractParseTreeVisitor} from 'antlr4ts/tree/AbstractParseTreeVisitor';
 import type {MalloyParserVisitor} from './lib/Malloy/MalloyParserVisitor';
 import type * as parse from './lib/Malloy/MalloyParser';
+import {
+  SpineStartContext,
+  SpineEndContext,
+} from './lib/Malloy/MalloyParser';
 import * as ast from './ast';
 import type {
   LogMessageOptions,
@@ -390,6 +394,57 @@ export class MalloyToAST
     const defList = new ast.DefineSourceList(defs);
     defList.extendNote({blockNotes});
     return defList;
+  }
+
+  visitDefineSpineSourceStatement(
+    pcx: parse.DefineSpineSourceStatementContext
+  ): ast.DefineSpineSourceList {
+    const defsCx = pcx.spineSourcePropertyList().spineSourceDefinition();
+    const defs = defsCx.map(dcx => this.visitSpineSourceDefinition(dcx));
+    const blockNotes = this.getNotes(pcx.tags());
+    const defList = new ast.DefineSpineSourceList(defs);
+    defList.extendNote({blockNotes});
+    return defList;
+  }
+
+  visitSpineSourceDefinition(
+    pcx: parse.SpineSourceDefinitionContext
+  ): ast.DefineSpineSource {
+    let startExpr: ast.ConstantExpression | undefined;
+    let endExpr: ast.ConstantExpression | undefined;
+
+    for (const prop of pcx.spineBody().spineProperty()) {
+      if (prop instanceof SpineStartContext) {
+        startExpr = this.astAt(
+          new ast.ConstantExpression(this.getFieldExpr(prop.fieldExpr())),
+          prop.fieldExpr()
+        );
+      } else if (prop instanceof SpineEndContext) {
+        endExpr = this.astAt(
+          new ast.ConstantExpression(this.getFieldExpr(prop.fieldExpr())),
+          prop.fieldExpr()
+        );
+      }
+    }
+
+    // Collect parameters directly (spine_source params are not behind the
+    // 'parameters' experiment flag — they are integral to the feature).
+    const paramsCx = pcx.sourceParameters();
+    const params: ast.HasParameter[] = paramsCx
+      ? paramsCx
+          .sourceParameter()
+          .map(p => this.getSourceParameter(p))
+          .filter((p): p is ast.HasParameter => p !== null)
+      : [];
+    const spineDef = new ast.DefineSpineSource(
+      getId(pcx.sourceNameDef()),
+      true,
+      startExpr,
+      endExpr,
+      params.length > 0 ? params : undefined
+    );
+    spineDef.extendNote({notes: this.getNotes(pcx.tags())});
+    return this.astAt(spineDef, pcx);
   }
 
   getSourceParameter(
@@ -1935,7 +1990,13 @@ export class MalloyToAST
 
   visitSQID(pcx: parse.SQIDContext) {
     const ref = this.getModelEntryName(pcx);
-    const args = this.getSQArguments(pcx.sourceArguments());
+    // Parse arguments directly (no experiment gate) — passing arguments to
+    // a parameterized source is required for spine sources and is harmless
+    // for any other source that declares parameters.
+    const argsCx = pcx.sourceArguments();
+    const args = argsCx
+      ? argsCx.sourceArgument().map(arg => this.getSQArgument(arg))
+      : undefined;
     return this.astAt(new ast.SQReference(ref, args), pcx.id());
   }
 

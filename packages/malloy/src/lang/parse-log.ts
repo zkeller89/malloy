@@ -422,6 +422,12 @@ type MessageParameterTypes = {
   'missing-required-group-by': string;
   'invalid-partition-composite': string;
   'integer-literal-out-of-range': string;
+  'spine-date-on-dimension': string;
+  'spine-group-on-measure': string;
+  'spine-missing-start': string;
+  'spine-missing-end': string;
+  'spine-start-must-be-temporal': string;
+  'spine-end-must-be-temporal': string;
 };
 
 export const MESSAGE_FORMATTERS: PartialErrorCodeMessageMap = {

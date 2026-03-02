@@ -1381,6 +1381,18 @@ export interface CompositeSourceDef extends SourceDefBase {
   sources: SourceDef[];
 }
 
+/**
+ * A synthetic date spine source. Unlike other source types, it does not
+ * reference a table or SQL — the rows are generated at query time.
+ * connection/dialect are intentionally omitted here; they are resolved
+ * when the spine is used in a query.
+ */
+export interface SpineSourceDef extends SourceDefBase {
+  type: 'spine';
+  spineStart: Expr;
+  spineEnd: Expr;
+}
+
 /*
  * Malloy has a kind of "strings" which is a list of segments. Each segment
  * is either a string, or a query, which is meant to be replaced
@@ -1489,8 +1501,15 @@ export function isSourceDef(sd: NamedModelObject | FieldDef): sd is SourceDef {
     sd.type === 'query_result' ||
     sd.type === 'finalize' ||
     sd.type === 'nest_source' ||
-    sd.type === 'composite'
+    sd.type === 'composite' ||
+    sd.type === 'spine'
   );
+}
+
+export function isSpineSourceDef(
+  sd: NamedModelObject | FieldDef
+): sd is SpineSourceDef {
+  return sd.type === 'spine';
 }
 
 /**
@@ -1511,7 +1530,8 @@ export type SourceDef =
   | QueryResultDef
   | FinalizeSourceDef
   | NestSourceDef
-  | CompositeSourceDef;
+  | CompositeSourceDef
+  | SpineSourceDef;
 
 /** Sources that can be persisted (materialized to tables) */
 export type PersistableSourceDef = SQLSourceDef | QuerySourceDef;
@@ -1825,6 +1845,7 @@ export function getIdentifier(n: AliasedName): string {
 
 export type NamedModelObject =
   | SourceDef
+  | SpineSourceDef
   | NamedQueryDef
   | FunctionDef
   | ConnectionDef;

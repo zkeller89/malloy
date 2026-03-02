@@ -1,0 +1,9 @@
+spine_source: daily_spine(grain::string) {
+  start: @2020-01-01
+  end: @2024-12-31
+}
+
+spine_source: monthly_spine(grain::string) {
+  start: @2023-01-01
+  end: @2024-12-31
+}

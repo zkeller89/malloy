@@ -331,12 +331,15 @@ export class QueryStruct {
 
   protected findFirstDialect(): string {
     if (isSourceDef(this.structDef)) {
-      return this.structDef.dialect;
+      const d = this.structDef.dialect;
+      if (d !== '') return d;
     }
     if (this.parent) {
       return this.parent.findFirstDialect();
     }
-    throw new Error('Cannot create QueryStruct from record with model parent');
+    // Dialect-agnostic sources (e.g., spine) have no dialect at definition time.
+    // Use standardsql as a placeholder; actual SQL generation uses query context dialect.
+    return 'standardsql';
   }
 
   maybeEmitParameterizedSourceUsage() {

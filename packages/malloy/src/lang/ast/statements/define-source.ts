@@ -21,8 +21,19 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-import type {Annotation, StructDef} from '../../../model/malloy_types';
-import {isPersistableSourceDef} from '../../../model/malloy_types';
+import type {
+  Annotation,
+  Parameter,
+  SpineSourceDef,
+  StructDef,
+} from '../../../model/malloy_types';
+import {
+  isPersistableSourceDef,
+  isTemporalType,
+  mkFieldDef,
+  mkSafeRecord,
+} from '../../../model/malloy_types';
+import type {ConstantExpression} from '../expressions/constant-expression';
 import {mkSourceID} from '../../../model/source_def_utils';
 import {ErrorFactory} from '../error-factory';
 import type {HasParameter} from '../parameters/has-parameter';
@@ -135,6 +146,92 @@ export class DefineSource
 export class DefineSourceList extends DocStatementList {
   elementType = 'defineSources';
   constructor(sourceList: DefineSource[]) {
+    super(sourceList);
+  }
+}
+
+export class DefineSpineSource
+  extends MalloyElement
+  implements DocStatement, Noteable
+{
+  elementType = 'defineSpineSource';
+  readonly isNoteableObj = true;
+  extendNote = extendNoteMethod;
+  note?: Annotation;
+
+  constructor(
+    readonly name: string,
+    readonly exported: boolean,
+    readonly startExpr?: ConstantExpression,
+    readonly endExpr?: ConstantExpression,
+    readonly parameters?: HasParameter[]
+  ) {
+    super();
+    if (startExpr) this.has({startExpr});
+    if (endExpr) this.has({endExpr});
+    if (parameters) this.has({parameters});
+  }
+
+  execute(doc: Document): void {
+    if (doc.modelEntry(this.name)) {
+      this.logError(
+        'source-definition-name-conflict',
+        `Cannot redefine '${this.name}'`
+      );
+      return;
+    }
+    if (!this.startExpr) {
+      this.logError('spine-missing-start', 'spine_source requires a start: property');
+      return;
+    }
+    if (!this.endExpr) {
+      this.logError('spine-missing-end', 'spine_source requires an end: property');
+      return;
+    }
+    const startVal = this.startExpr.constantValue();
+    if (!isTemporalType(startVal.type)) {
+      this.startExpr.logError(
+        'spine-start-must-be-temporal',
+        'start: must be a date or timestamp literal'
+      );
+      return;
+    }
+    const endVal = this.endExpr.constantValue();
+    if (!isTemporalType(endVal.type)) {
+      this.endExpr.logError(
+        'spine-end-must-be-temporal',
+        'end: must be a date or timestamp literal'
+      );
+      return;
+    }
+    const entry: SpineSourceDef = {
+      type: 'spine',
+      name: this.name,
+      fields: [mkFieldDef({type: 'timestamp'}, 'spine_date')],
+      location: this.location,
+      // connection/dialect are not known at definition time; resolved at query time
+      connection: '',
+      dialect: '',
+      spineStart: startVal.value,
+      spineEnd: endVal.value,
+    };
+    if (this.parameters && this.parameters.length > 0) {
+      const params = mkSafeRecord<Parameter>();
+      for (const p of this.parameters) {
+        params[p.name] = p.parameter();
+      }
+      entry.parameters = params;
+    }
+    if (this.note) {
+      entry.annotation = this.note;
+    }
+    doc.setEntry(this.name, {entry, exported: this.exported});
+  }
+}
+
+export class DefineSpineSourceList extends DocStatementList {
+  elementType = 'defineSpineSources';
+  constructor(sourceList: DefineSpineSource[]) {
     super(sourceList);
   }
 }
