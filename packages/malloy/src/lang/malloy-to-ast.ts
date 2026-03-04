@@ -30,6 +30,8 @@ import type * as parse from './lib/Malloy/MalloyParser';
 import {
   SpineStartContext,
   SpineEndContext,
+  SpineCompositeSpineRefContext,
+  SpineCompositeJoinRefContext,
 } from './lib/Malloy/MalloyParser';
 import * as ast from './ast';
 import type {
@@ -445,6 +447,57 @@ export class MalloyToAST
     );
     spineDef.extendNote({notes: this.getNotes(pcx.tags())});
     return this.astAt(spineDef, pcx);
+  }
+
+  visitDefineSpineCompositeStatement(
+    pcx: parse.DefineSpineCompositeStatementContext
+  ): ast.DefineSpineCompositeList {
+    const defsCx = pcx
+      .spineCompositePropertyList()
+      .spineCompositeDefinition();
+    const defs = defsCx.map(dcx => this.visitSpineCompositeDefinition(dcx));
+    const blockNotes = this.getNotes(pcx.tags());
+    const defList = new ast.DefineSpineCompositeList(defs);
+    defList.extendNote({blockNotes});
+    return defList;
+  }
+
+  visitSpineCompositeDefinition(
+    pcx: parse.SpineCompositeDefinitionContext
+  ): ast.DefineSpineComposite {
+    let spineRef: string | undefined;
+    const joinRefs: string[] = [];
+
+    for (const item of pcx.spineCompositeBody().spineCompositeItem()) {
+      if (item instanceof SpineCompositeSpineRefContext) {
+        spineRef = idToStr(item.id());
+      } else if (item instanceof SpineCompositeJoinRefContext) {
+        joinRefs.push(idToStr(item.id()));
+      }
+    }
+
+    if (!spineRef) {
+      // Will be caught by execute() but we still need to construct
+      spineRef = '';
+    }
+
+    const paramsCx = pcx.sourceParameters();
+    const params: ast.HasParameter[] = paramsCx
+      ? paramsCx
+          .sourceParameter()
+          .map(p => this.getSourceParameter(p))
+          .filter((p): p is ast.HasParameter => p !== null)
+      : [];
+
+    const compositeDef = new ast.DefineSpineComposite(
+      getId(pcx.sourceNameDef()),
+      true,
+      spineRef,
+      joinRefs,
+      params.length > 0 ? params : undefined
+    );
+    compositeDef.extendNote({notes: this.getNotes(pcx.tags())});
+    return this.astAt(compositeDef, pcx);
   }
 
   getSourceParameter(

@@ -250,6 +250,15 @@ export class MeasureFieldDeclaration extends AtomicFieldDeclaration {
           'spine.group is only valid on dimensions, not measures'
         );
       }
+      if (tag.tag('spine')?.has('date')) {
+        const dateField = tag.text('spine', 'date');
+        if (!dateField) {
+          this.logError(
+            'spine-date-missing-field',
+            '# spine.date requires a field name, e.g. # spine.date=arrival_time'
+          );
+        }
+      }
     }
   }
 }
