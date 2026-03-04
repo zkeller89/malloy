@@ -1393,6 +1393,48 @@ export interface SpineSourceDef extends SourceDefBase {
   spineEnd: Expr;
 }
 
+/**
+ * One entry per (fact source, date field) pair within a spine_composite.
+ * A single fact source with two ## spine.date measures generates two entries
+ * with different aliases and dateFields.
+ */
+export interface SpineFactJoin {
+  sourceRef: string; // name of the fact source (e.g. 'flights')
+  alias: string; // unique SQL alias (e.g. 'flights__arrival_time')
+  dateField: string; // date/timestamp column to match against spine_date
+  measures: string[]; // measure names that use this dateField
+  groupFields: string[]; // ## spine.group field names in this source
+}
+
+/**
+ * One entry per fact source that contributes distinct group values for
+ * the CROSS JOIN groups subquery in a spine_composite.
+ */
+export interface SpineGroupSource {
+  sourceRef: string; // source name
+  groupFields: string[]; // ## spine.group field names in that source
+}
+
+/**
+ * A composite source that pairs a spine_source with one or more fact tables.
+ * Produces a zero-filled result where every (spine_date, group) combination
+ * appears, even when the fact table has no matching rows.
+ */
+export interface SpineCompositeDef extends SourceDefBase {
+  type: 'spine_composite';
+  spineSourceRef: string; // name of the spine_source definition
+  // parameters? inherited from SourceDefBase — holds grain::string etc.
+  // At query time, qs.structDef.arguments['grain'] carries the runtime value.
+  spineFactJoins: SpineFactJoin[]; // one per (source × dateField) pair
+  spineGroupSources: SpineGroupSource[]; // sources contributing to groups UNION
+}
+
+export function isSpineCompositeDef(
+  sd: NamedModelObject | FieldDef
+): sd is SpineCompositeDef {
+  return sd.type === 'spine_composite';
+}
+
 /*
  * Malloy has a kind of "strings" which is a list of segments. Each segment
  * is either a string, or a query, which is meant to be replaced
@@ -1502,7 +1544,8 @@ export function isSourceDef(sd: NamedModelObject | FieldDef): sd is SourceDef {
     sd.type === 'finalize' ||
     sd.type === 'nest_source' ||
     sd.type === 'composite' ||
-    sd.type === 'spine'
+    sd.type === 'spine' ||
+    sd.type === 'spine_composite'
   );
 }
 
@@ -1531,7 +1574,8 @@ export type SourceDef =
   | FinalizeSourceDef
   | NestSourceDef
   | CompositeSourceDef
-  | SpineSourceDef;
+  | SpineSourceDef
+  | SpineCompositeDef;
 
 /** Sources that can be persisted (materialized to tables) */
 export type PersistableSourceDef = SQLSourceDef | QuerySourceDef;
