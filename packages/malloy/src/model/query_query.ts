@@ -31,6 +31,9 @@ import type {
   Query,
   PrepareResultOptions,
   SpineSourceDef,
+  SpineCompositeDef,
+  TableSourceDef,
+  AtomicFieldDef,
   DateLiteralNode,
   TimestampLiteralNode,
   StringLiteralNode,
@@ -43,7 +46,9 @@ import {
   isAtomic,
   expressionIsCalculation,
   expressionIsScalar,
+  expressionIsAggregate,
   getIdentifier,
+  isJoined,
   isJoinedSource,
   isBasicArray,
   isIndexSegment,
@@ -848,6 +853,92 @@ export class QueryQuery extends QueryField {
         const grainNode = grainArg?.value as StringLiteralNode | null;
         const grain = grainNode?.literal ?? 'day';
         return this.parent.dialect.sqlDateSpine(start, end, grain);
+      }
+      case 'spine_composite': {
+        const def = qs.structDef as SpineCompositeDef;
+        // Grain from runtime arguments (e.g. flight_analysis(grain = 'day')).
+        // Use qs.arguments() which merges structDef.arguments and sourceArguments.
+        const grainArg = qs.arguments()['grain'];
+        const grainNode = grainArg?.value as StringLiteralNode | null;
+        const grain = grainNode?.literal ?? 'day';
+
+        // Look up spine source to get start/end dates
+        const model = qs.getModel();
+        const spineQS = model.structs.get(def.spineSourceRef);
+        if (!spineQS) {
+          throw new Error(
+            `spine_composite: Cannot find spine source '${def.spineSourceRef}'`
+          );
+        }
+        const spineDef = spineQS.structDef as SpineSourceDef;
+        const startNode = spineDef.spineStart as
+          | DateLiteralNode
+          | TimestampLiteralNode;
+        const endNode = spineDef.spineEnd as
+          | DateLiteralNode
+          | TimestampLiteralNode;
+        const spineSQL = this.parent.dialect.sqlDateSpine(
+          startNode.literal,
+          endNode.literal,
+          grain
+        );
+
+        // Collect group field names: scalar non-spine_date non-joined fields
+        const allGroupFields: string[] = [];
+        for (const field of def.fields) {
+          if (
+            'type' in field &&
+            field.name !== 'spine_date' &&
+            !isJoined(field) &&
+            !expressionIsAggregate((field as AtomicFieldDef).expressionType)
+          ) {
+            allGroupFields.push((field as AtomicFieldDef).as ?? field.name);
+          }
+        }
+
+        if (allGroupFields.length === 0) {
+          // No group dimensions: just the date spine
+          return spineSQL;
+        }
+
+        // Build UNION of distinct group combinations from all group sources.
+        // Sources missing a particular group field emit NULL for that column.
+        const unionParts: string[] = [];
+        for (const gs of def.spineGroupSources) {
+          const factQS = model.structs.get(gs.sourceRef);
+          if (!factQS) continue;
+          const factDef = factQS.structDef;
+          // For table sources use the quoted table path; for all other types
+          // (sql_select, query_source, etc.) delegate to getStructSourceSQL so
+          // the correct SQL subquery is emitted.
+          const factSQL =
+            factDef.type === 'table'
+              ? this.parent.dialect.quoteTablePath(
+                  (factDef as TableSourceDef).tablePath
+                )
+              : `${this.getStructSourceSQL(factQS, stageWriter)} AS __spine_groups_${gs.sourceRef}`;
+          const selectCols = allGroupFields
+            .map(g =>
+              gs.groupFields.includes(g) ? g : `CAST(NULL AS VARCHAR) AS ${g}`
+            )
+            .join(', ');
+          unionParts.push(`SELECT DISTINCT ${selectCols} FROM ${factSQL}`);
+        }
+
+        const groupCols = allGroupFields.join(', ');
+        const groupSQL = unionParts.join('\nUNION ALL\n');
+
+        return (
+          `(\n` +
+          `  SELECT __spine.spine_date, ${groupCols}\n` +
+          `  FROM ${spineSQL} AS __spine\n` +
+          `  CROSS JOIN (\n` +
+          `    SELECT DISTINCT ${groupCols} FROM (\n` +
+          `      ${groupSQL}\n` +
+          `    ) AS __all_groups\n` +
+          `  ) AS __groups\n` +
+          `)`
+        );
       }
       default:
         throw new Error(

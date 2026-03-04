@@ -136,6 +136,15 @@ export class StandardSQLDialect extends Dialect {
     {min: MIN_INT64, max: MAX_INT64, numberType: 'bigint'},
   ];
 
+  override sqlDateSpine(start: string, end: string, grain: string): string {
+    const unit = grain.toUpperCase();
+    return (
+      `(SELECT ts AS spine_date FROM UNNEST(` +
+      `GENERATE_TIMESTAMP_ARRAY(TIMESTAMP '${start}', TIMESTAMP '${end}', INTERVAL 1 ${unit})` +
+      `) AS ts)`
+    );
+  }
+
   quoteTablePath(tablePath: string): string {
     return `\`${tablePath}\``;
   }
