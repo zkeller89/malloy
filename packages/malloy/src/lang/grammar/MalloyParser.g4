@@ -30,6 +30,7 @@ malloyDocument: (malloyStatement | SEMI)* EOF;
 malloyStatement
   : defineSourceStatement
   | defineSpineSourceStatement
+  | defineSpineCompositeStatement
   | defineQuery
   | importStatement
   | runStatement
@@ -44,6 +45,28 @@ defineSourceStatement
 
 defineSpineSourceStatement
   : tags SPINE_SOURCE spineSourcePropertyList
+  ;
+
+defineSpineCompositeStatement
+  : tags SPINE_COMPOSITE spineCompositePropertyList
+  ;
+
+spineCompositePropertyList
+  : spineCompositeDefinition (COMMA? spineCompositeDefinition)* COMMA?
+  ;
+
+spineCompositeDefinition
+  : tags sourceNameDef sourceParameters? spineCompositeBody
+  ;
+
+spineCompositeBody
+  : OCURLY spineCompositeItem* CCURLY
+  ;
+
+spineCompositeItem
+  : SPINE_KW id      # spineCompositeSpineRef
+  | SPINE_JOIN_KW id # spineCompositeJoinRef
+  | ANNOTATION+      # spineCompositeAnnotation
   ;
 
 spineSourcePropertyList
