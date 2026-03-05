@@ -32,6 +32,7 @@ import type {
   PrepareResultOptions,
   SpineSourceDef,
   SpineCompositeDef,
+  SourceDef,
   TableSourceDef,
   AtomicFieldDef,
   DateLiteralNode,
@@ -768,6 +769,40 @@ export class QueryQuery extends QueryField {
     return outputStruct;
   }
 
+  /**
+   * Returns the SQL expression for a group field within a fact source, suitable
+   * for use in a bare `SELECT <expr> AS <name> FROM <fact_sql>` without any
+   * join prefix. Handles the common case where the field is a Malloy dimension
+   * that aliases an underlying column (e.g. `carrier_dim is carrier`).
+   */
+  private groupFieldExprSQL(
+    fields: FieldDef[],
+    fieldName: string,
+    depth = 0
+  ): string {
+    if (depth > 10) return fieldName; // guard against cycles
+    const fieldDef = fields.find(
+      f => ((f as AtomicFieldDef).as ?? f.name) === fieldName
+    ) as AtomicFieldDef | undefined;
+
+    if (!fieldDef) return fieldName;
+
+    if (!hasExpression(fieldDef)) {
+      // Primitive / renamed field — the raw SQL column name is fieldDef.name.
+      return fieldDef.name;
+    }
+
+    const e = fieldDef.e;
+    // Simple field reference: recurse to follow renames or aliases.
+    // e.g. `dimension: carrier is carrier_raw` where carrier_raw is a rename.
+    if (e.node === 'field' && e.path.length === 1) {
+      return this.groupFieldExprSQL(fields, e.path[0], depth + 1);
+    }
+
+    // For more complex expressions (joins, functions, etc.) fall back.
+    return fieldName;
+  }
+
   getStructSourceSQL(qs: QueryStruct, stageWriter: StageWriter): string {
     switch (qs.structDef.type) {
       case 'table':
@@ -918,9 +953,16 @@ export class QueryQuery extends QueryField {
                 )
               : `${this.getStructSourceSQL(factQS, stageWriter)} AS __spine_groups_${gs.sourceRef}`;
           const selectCols = allGroupFields
-            .map(g =>
-              gs.groupFields.includes(g) ? g : `CAST(NULL AS VARCHAR) AS ${g}`
-            )
+            .map(g => {
+              if (!gs.groupFields.includes(g)) {
+                return `CAST(NULL AS VARCHAR) AS ${g}`;
+              }
+              // Resolve the field to its underlying SQL expression so that
+              // computed dimensions (e.g. `carrier_dim is carrier`) produce
+              // `carrier AS carrier_dim` rather than the non-existent column name.
+              const exprSQL = this.groupFieldExprSQL(factDef.fields, g);
+              return exprSQL === g ? g : `${exprSQL} AS ${g}`;
+            })
             .join(', ');
           unionParts.push(`SELECT DISTINCT ${selectCols} FROM ${factSQL}`);
         }
