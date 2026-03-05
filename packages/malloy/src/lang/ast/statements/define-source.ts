@@ -28,6 +28,7 @@ import type {
   SpineCompositeDef,
   SpineFactJoin,
   SpineGroupSource,
+  SourceDef,
   StructDef,
   FieldDef,
   AtomicFieldDef,
@@ -414,6 +415,18 @@ export class DefineSpineComposite
             return {type: gDef.type, name: g} as FieldDef;
           }),
         ];
+        // The join entry inherits primaryKey from ...entry. If the fact source
+        // declares a primary key, include it in joinFields so the expression
+        // compiler can resolve it when checking for symmetric aggregation.
+        const pk = (entry as SourceDef).primaryKey;
+        if (pk && !joinFields.some(f => f.name === pk)) {
+          const pkDef = entry.fields.find(
+            f => ((f as AtomicFieldDef).as ?? f.name) === pk
+          ) as AtomicFieldDef | undefined;
+          if (pkDef) {
+            joinFields.push({type: pkDef.type, name: pk} as FieldDef);
+          }
+        }
 
         // Join entry: copy the fact source's struct def so getStructSourceSQL
         // can reconstruct the correct SQL (e.g. inline SQL subquery for sql_select).

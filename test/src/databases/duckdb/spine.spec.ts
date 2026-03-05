@@ -123,4 +123,41 @@ describe.each(runtimes.runtimeList)('spine:%s', (dbName, runtime) => {
       {event_count: 0},
     ]);
   });
+
+  it('works when the fact source declares a primary_key', async () => {
+    // Regression: joinEntry inherits primaryKey from the fact source via ...entry.
+    // The expression compiler tries to resolve that field for symmetric aggregate
+    // detection and fails if it isn't present in joinFields.
+    await expect(`
+      source: keyed_events is ${dbName}.sql("""
+        SELECT 1 as id, TIMESTAMP '2024-01-01 10:00:00' as event_time UNION ALL
+        SELECT 2 as id, TIMESTAMP '2024-01-15 12:00:00' as event_time UNION ALL
+        SELECT 3 as id, TIMESTAMP '2024-02-05 10:00:00' as event_time
+      """) extend {
+        primary_key: id
+        # spine.date=event_time
+        measure: event_count is count()
+      }
+
+      spine_source: pk_spine(grain::string) {
+        start: @2024-01-01
+        end:   @2024-03-01
+      }
+
+      spine_composite: pk_rollup(grain::string) {
+        spine: pk_spine
+        spine_join: keyed_events
+      }
+
+      run: pk_rollup(grain is 'month') -> {
+        group_by: spine_date
+        aggregate: event_count
+        order_by: spine_date
+      }
+    `).toMatchRows(testModel, [
+      {event_count: 2},
+      {event_count: 1},
+      {event_count: 0},
+    ]);
+  });
 });
