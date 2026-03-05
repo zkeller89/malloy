@@ -42,6 +42,7 @@ import {
   isTemporalType,
   expressionIsAggregate,
   expressionIsScalar,
+  hasExpression,
   mkFieldDef,
   mkSafeRecord,
 } from '../../../model/malloy_types';
@@ -251,6 +252,36 @@ export class DefineSpineSourceList extends DocStatementList {
   }
 }
 
+/**
+ * Given a Malloy field name in a source's field list, return the underlying
+ * raw SQL column name by recursively following field-reference expressions
+ * and renames.  For a plain column `dep_time`, returns `dep_time`.  For
+ * `rename: dep_ts is dep_time` and Malloy name `dep_ts`, returns `dep_time`.
+ * For `dimension: carrier is carrier_raw` (where carrier_raw is a rename of
+ * the SQL column `carrier`), also correctly resolves to `carrier`.
+ */
+function resolveRawColumn(
+  fields: FieldDef[],
+  malloyName: string,
+  depth = 0
+): string {
+  if (depth > 10) return malloyName;
+  const field = fields.find(
+    f => ((f as AtomicFieldDef).as ?? f.name) === malloyName
+  ) as AtomicFieldDef | undefined;
+  if (!field) return malloyName;
+  if (!hasExpression(field)) {
+    // Primitive or renamed field: the SQL column name is field.name.
+    return field.name;
+  }
+  const e = field.e;
+  if (e.node === 'field' && e.path.length === 1) {
+    return resolveRawColumn(fields, e.path[0], depth + 1);
+  }
+  // Complex expression — fall back to the Malloy name.
+  return malloyName;
+}
+
 export class DefineSpineComposite
   extends MalloyElement
   implements DocStatement, Noteable
@@ -406,13 +437,27 @@ export class DefineSpineComposite
         const dateFieldDefForJoin = entry.fields.find(
           f => ((f as AtomicFieldDef).as ?? f.name) === dateField
         ) as AtomicFieldDef;
+        // Use the raw SQL column name as `name` (what the compiler emits) and
+        // the Malloy alias as `as` (nameMap lookup key) so that IR field
+        // references like {node:'field', path:[alias, dateField]} resolve to
+        // the correct column even when the field is renamed.
+        const rawDateCol = resolveRawColumn(entry.fields, dateField);
         const joinFields: FieldDef[] = [
-          {type: dateFieldDefForJoin.type, name: dateField} as FieldDef,
+          {
+            type: dateFieldDefForJoin.type,
+            name: rawDateCol,
+            ...(rawDateCol !== dateField ? {as: dateField} : {}),
+          } as FieldDef,
           ...groupFields.map(g => {
             const gDef = entry.fields.find(
               f => ((f as AtomicFieldDef).as ?? f.name) === g
             ) as AtomicFieldDef;
-            return {type: gDef.type, name: g} as FieldDef;
+            const rawCol = resolveRawColumn(entry.fields, g);
+            return {
+              type: gDef.type,
+              name: rawCol,
+              ...(rawCol !== g ? {as: g} : {}),
+            } as FieldDef;
           }),
         ];
         // The join entry inherits primaryKey from ...entry. If the fact source

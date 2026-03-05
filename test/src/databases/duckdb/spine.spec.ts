@@ -124,6 +124,49 @@ describe.each(runtimes.runtimeList)('spine:%s', (dbName, runtime) => {
     ]);
   });
 
+  it('handles renamed spine.date and spine.group fields', async () => {
+    // Regression: joinFields used the Malloy alias as the SQL column name.
+    // With rename: ts_col is raw_ts, the SQL column is raw_ts but the Malloy
+    // name is ts_col.  The JOIN ON must reference raw_ts, not ts_col.
+    await expect(`
+      source: renamed_events is ${dbName}.sql("""
+        SELECT TIMESTAMP '2024-01-01 10:00:00' as raw_ts, 'A' as raw_carrier UNION ALL
+        SELECT TIMESTAMP '2024-01-01 14:00:00' as raw_ts, 'A' as raw_carrier UNION ALL
+        SELECT TIMESTAMP '2024-01-03 09:00:00' as raw_ts, 'B' as raw_carrier
+      """) extend {
+        rename: ts_col is raw_ts
+        rename: carrier_col is raw_carrier
+        # spine.group
+        dimension: carrier is carrier_col
+        # spine.date=ts_col
+        measure: event_count is count()
+      }
+
+      spine_source: rename_spine(grain::string) {
+        start: @2024-01-01
+        end: @2024-01-03
+      }
+
+      spine_composite: rename_rollup(grain::string) {
+        spine: rename_spine
+        spine_join: renamed_events
+      }
+
+      run: rename_rollup(grain is 'day') -> {
+        group_by: spine_date, carrier
+        aggregate: event_count
+        order_by: spine_date, carrier
+      }
+    `).toMatchRows(testModel, [
+      {carrier: 'A', event_count: 2},
+      {carrier: 'B', event_count: 0},
+      {carrier: 'A', event_count: 0},
+      {carrier: 'B', event_count: 0},
+      {carrier: 'A', event_count: 0},
+      {carrier: 'B', event_count: 1},
+    ]);
+  });
+
   it('works when the fact source declares a primary_key', async () => {
     // Regression: joinEntry inherits primaryKey from the fact source via ...entry.
     // The expression compiler tries to resolve that field for symmetric aggregate
