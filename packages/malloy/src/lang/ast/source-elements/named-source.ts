@@ -136,7 +136,9 @@ export class NamedSource extends Source {
       );
       return;
     } else {
-      this.document()?.checkExperimentalDialect(this, entry.dialect);
+      if (isSourceDef(entry) && entry.dialect) {
+        this.document()?.checkExperimentalDialect(this, entry.dialect);
+      }
       if (isSourceDef(entry)) {
         return {...entry};
       }

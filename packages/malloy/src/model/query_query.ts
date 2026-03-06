@@ -30,6 +30,17 @@ import type {
   UniqueKeyRequirement,
   Query,
   PrepareResultOptions,
+  SpineSourceDef,
+  SpineCompositeDef,
+  SourceDef,
+  TableSourceDef,
+  AtomicFieldDef,
+  AggregateExpr,
+  FieldnameNode,
+  Expr,
+  DateLiteralNode,
+  TimestampLiteralNode,
+  StringLiteralNode,
 } from './malloy_types';
 import {
   isRawSegment,
@@ -39,7 +50,9 @@ import {
   isAtomic,
   expressionIsCalculation,
   expressionIsScalar,
+  expressionIsAggregate,
   getIdentifier,
+  isJoined,
   isJoinedSource,
   isBasicArray,
   isIndexSegment,
@@ -759,6 +772,67 @@ export class QueryQuery extends QueryField {
     return outputStruct;
   }
 
+  /**
+   * Returns the SQL expression for a group field within a fact source, suitable
+   * for use in a bare `SELECT <expr> AS <name> FROM <fact_sql>` without any
+   * join prefix. Handles the common case where the field is a Malloy dimension
+   * that aliases an underlying column (e.g. `carrier_dim is carrier`).
+   */
+  private groupFieldExprSQL(
+    fields: FieldDef[],
+    fieldName: string,
+    depth = 0
+  ): string {
+    if (depth > 10) return fieldName; // guard against cycles
+    const fieldDef = fields.find(
+      f => ((f as AtomicFieldDef).as ?? f.name) === fieldName
+    ) as AtomicFieldDef | undefined;
+
+    if (!fieldDef) return fieldName;
+
+    if (!hasExpression(fieldDef)) {
+      // Primitive / renamed field — the raw SQL column name is fieldDef.name.
+      return fieldDef.name;
+    }
+
+    const e = fieldDef.e;
+    // Simple field reference: recurse to follow renames or aliases.
+    // e.g. `dimension: carrier is carrier_raw` where carrier_raw is a rename.
+    if (e.node === 'field' && e.path.length === 1) {
+      return this.groupFieldExprSQL(fields, e.path[0], depth + 1);
+    }
+
+    // For more complex expressions (joins, functions, etc.) fall back.
+    return fieldName;
+  }
+
+  /**
+   * Generate a SQL aggregate expression suitable for a pre-aggregation subquery.
+   * For simple cases (count, sum, avg, min, max over a field), produces the
+   * corresponding SQL.  Falls back to COUNT(*) for complex expressions.
+   */
+  private preAggExprSQL(measureExpr: Expr, factFields: FieldDef[]): string {
+    if (measureExpr.node !== 'aggregate') return 'COUNT(*)';
+    const aggExpr = measureExpr as AggregateExpr;
+    const fn = aggExpr.function.toUpperCase();
+
+    // count() has no meaningful field argument — always COUNT(*) in pre-agg context.
+    if (aggExpr.function === 'count') return 'COUNT(*)';
+
+    // For sum/avg/min/max/distinct, try to resolve the field argument.
+    const argExpr = aggExpr.e as Expr | undefined;
+    if (argExpr && argExpr.node === 'field') {
+      const path = (argExpr as FieldnameNode).path;
+      const fieldRef = path[path.length - 1] ?? '';
+      const rawCol = this.groupFieldExprSQL(factFields, fieldRef);
+      if (aggExpr.function === 'distinct') return `COUNT(DISTINCT ${rawCol})`;
+      return `${fn}(${rawCol})`;
+    }
+
+    // Fallback for complex expressions: COUNT(*) for count, else use the function name.
+    return 'COUNT(*)';
+  }
+
   getStructSourceSQL(qs: QueryStruct, stageWriter: StageWriter): string {
     switch (qs.structDef.type) {
       case 'table':
@@ -829,6 +903,199 @@ export class QueryQuery extends QueryField {
           qs.parent !== undefined
         );
         return ret.lastStageName;
+      }
+      case 'spine': {
+        const def = qs.structDef as SpineSourceDef;
+        // Extract literal values from the spineStart / spineEnd IR expressions.
+        const startNode = def.spineStart as
+          | DateLiteralNode
+          | TimestampLiteralNode;
+        const endNode = def.spineEnd as DateLiteralNode | TimestampLiteralNode;
+        const start = startNode.literal;
+        const end = endNode.literal;
+        // Grain comes from the resolved sourceArguments (e.g. grain is 'day').
+        const grainArg = qs.structDef.arguments?.['grain'];
+        const grainNode = grainArg?.value as StringLiteralNode | null;
+        const grain = grainNode?.literal ?? 'day';
+        return this.parent.dialect.sqlDateSpine(start, end, grain);
+      }
+      case 'spine_composite': {
+        const def = qs.structDef as SpineCompositeDef;
+        // Grain from runtime arguments (e.g. flight_analysis(grain = 'day')).
+        const grainArg = qs.arguments()['grain'];
+        const grainNode = grainArg?.value as StringLiteralNode | null;
+        const grain = grainNode?.literal ?? 'day';
+
+        // Look up spine source to get start/end dates.
+        const model = qs.getModel();
+        const spineQS = model.structs.get(def.spineSourceRef);
+        if (!spineQS) {
+          throw new Error(
+            `spine_composite: Cannot find spine source '${def.spineSourceRef}'`
+          );
+        }
+        const spineDef = spineQS.structDef as SpineSourceDef;
+        const startNode = spineDef.spineStart as
+          | DateLiteralNode
+          | TimestampLiteralNode;
+        const endNode = spineDef.spineEnd as
+          | DateLiteralNode
+          | TimestampLiteralNode;
+        const spineSQL = this.parent.dialect.sqlDateSpine(
+          startNode.literal,
+          endNode.literal,
+          grain
+        );
+
+        // Collect group field names (non-spine_date, non-aggregate scalars).
+        const allGroupFields: string[] = [];
+        for (const field of def.fields) {
+          if (
+            'type' in field &&
+            field.name !== 'spine_date' &&
+            !isJoined(field) &&
+            !expressionIsAggregate((field as AtomicFieldDef).expressionType)
+          ) {
+            allGroupFields.push((field as AtomicFieldDef).as ?? field.name);
+          }
+        }
+
+        // Helper to get a fact source's SQL and alias it when it's a subquery.
+        const factSourceSQL = (
+          factQS: QueryStruct,
+          suffix: string
+        ): string => {
+          const rawSQL = this.getStructSourceSQL(factQS, stageWriter);
+          return factQS.structDef.type === 'table'
+            ? rawSQL
+            : `${rawSQL} AS ${suffix}`;
+        };
+
+        // Build the base subquery: spine CROSS JOIN groups (or just spine if none).
+        let baseSQL: string;
+        if (allGroupFields.length === 0) {
+          baseSQL = `SELECT spine_date FROM ${spineSQL} AS __spine_series`;
+        } else {
+          const unionParts: string[] = [];
+          for (const gs of def.spineGroupSources) {
+            const factQS = model.structs.get(gs.sourceRef);
+            if (!factQS) continue;
+            const factDef = factQS.structDef;
+            const factSQL = factSourceSQL(
+              factQS,
+              `__spine_groups_${gs.sourceRef}`
+            );
+            const selectCols = allGroupFields
+              .map(g => {
+                if (!gs.groupFields.includes(g)) {
+                  return `CAST(NULL AS VARCHAR) AS ${g}`;
+                }
+                const exprSQL = this.groupFieldExprSQL(factDef.fields, g);
+                return exprSQL === g ? g : `${exprSQL} AS ${g}`;
+              })
+              .join(', ');
+            unionParts.push(`SELECT DISTINCT ${selectCols} FROM ${factSQL}`);
+          }
+          const groupCols = allGroupFields.join(', ');
+          const groupSQL = unionParts.join('\nUNION ALL\n');
+          baseSQL =
+            `SELECT __spine.spine_date, ${groupCols}\n` +
+            `FROM ${spineSQL} AS __spine\n` +
+            `CROSS JOIN (\n` +
+            `  SELECT DISTINCT ${groupCols} FROM (\n` +
+            `    ${groupSQL}\n` +
+            `  ) AS __all_groups\n` +
+            `) AS __groups`;
+        }
+
+        // Build one pre-agg LEFT JOIN per SpineFactJoin.
+        // Each pre-agg produces (period, group_dims..., measures...) with at most
+        // one row per (period, group) combination, eliminating fan-out from stacked
+        // LEFT JOINs and making outer SUM(pre_agg_col) correct regardless of how
+        // many fact joins are present.
+        const preAggJoinLines: string[] = [];
+        for (const fj of def.spineFactJoins) {
+          const factQS = model.structs.get(fj.sourceRef);
+          if (!factQS) continue;
+          const factDef = factQS.structDef;
+          const factSQL = factSourceSQL(factQS, `__preagg_src_${fj.alias}`);
+
+          // Date column: resolve Malloy name → raw SQL column, then DATE_TRUNC.
+          const rawDateCol = this.groupFieldExprSQL(
+            factDef.fields,
+            fj.dateField
+          );
+          const truncExpr = this.parent.dialect.sqlDateTruncExpr(
+            grain,
+            rawDateCol
+          );
+
+          const preAggCols: string[] = [`${truncExpr} AS __period`];
+
+          // Group fields: raw SQL expr AS malloy_name (JOIN ON uses Malloy name).
+          for (const g of fj.groupFields) {
+            const rawCol = this.groupFieldExprSQL(factDef.fields, g);
+            preAggCols.push(rawCol === g ? g : `${rawCol} AS ${g}`);
+          }
+
+          // Measure columns: derive aggregation from original fact field expression.
+          for (const measureName of fj.measures) {
+            const origField = (factDef.fields as AtomicFieldDef[]).find(
+              f => (f.as ?? f.name) === measureName
+            );
+            const aggSQL = origField?.e
+              ? this.preAggExprSQL(origField.e, factDef.fields)
+              : 'COUNT(*)';
+            preAggCols.push(`${aggSQL} AS ${measureName}`);
+          }
+
+          // GROUP BY: position 1 (__period) plus one per group field.
+          const groupByPositions = Array.from(
+            {length: 1 + fj.groupFields.length},
+            (_, i) => i + 1
+          ).join(', ');
+
+          const preAggBody =
+            `SELECT ${preAggCols.join(', ')}\n` +
+            `FROM ${factSQL}\n` +
+            `GROUP BY ${groupByPositions}`;
+
+          // JOIN ON: period = spine_date plus group field equalities.
+          const onParts = [`${fj.alias}.__period = __sg.spine_date`];
+          for (const g of fj.groupFields) {
+            onParts.push(`${fj.alias}.${g} = __sg.${g}`);
+          }
+
+          preAggJoinLines.push(
+            `LEFT JOIN (\n${preAggBody}\n) AS ${fj.alias}\n  ON ${onParts.join(' AND ')}`
+          );
+        }
+
+        if (preAggJoinLines.length === 0) {
+          return `(\n${baseSQL}\n)`;
+        }
+
+        // Outer SELECT: spine_date + group dims + pre-agg measure values (NULL if
+        // no matching rows; the outer COALESCE(SUM(...),0) converts NULL → 0).
+        const outerCols: string[] = ['__sg.spine_date'];
+        for (const g of allGroupFields) {
+          outerCols.push(`__sg.${g}`);
+        }
+        for (const fj of def.spineFactJoins) {
+          for (const m of fj.measures) {
+            outerCols.push(`${fj.alias}.${m}`);
+          }
+        }
+
+        return (
+          `(\n` +
+          `  SELECT ${outerCols.join(', ')}\n` +
+          `  FROM (\n` +
+          `    ${baseSQL}\n` +
+          `  ) AS __sg\n` +
+          preAggJoinLines.join('\n') +
+          `\n)`
+        );
       }
       default:
         throw new Error(

@@ -35,6 +35,7 @@ import {
 } from '../../../model/malloy_types';
 
 import * as TDU from '../typedesc-utils';
+import {annotationToTag} from '../../../annotation';
 import type {ExprValue} from '../types/expr-value';
 import type {ExpressionDef} from '../types/expression-def';
 import type {FieldSpace} from '../types/field-space';
@@ -241,6 +242,24 @@ export class MeasureFieldDeclaration extends AtomicFieldDeclaration {
   elementType = 'measureFieldDeclaration';
   typecheckExprValue(expr: ExprValue) {
     typecheckMeasure(expr, this);
+    if (this.note) {
+      const {tag} = annotationToTag(this.note);
+      if (tag.tag('spine')?.has('group')) {
+        this.logError(
+          'spine-group-on-measure',
+          'spine.group is only valid on dimensions, not measures'
+        );
+      }
+      if (tag.tag('spine')?.has('date')) {
+        const dateField = tag.text('spine', 'date');
+        if (!dateField) {
+          this.logError(
+            'spine-date-missing-field',
+            '# spine.date requires a field name, e.g. # spine.date=arrival_time'
+          );
+        }
+      }
+    }
   }
 }
 
@@ -248,6 +267,15 @@ export class DimensionFieldDeclaration extends AtomicFieldDeclaration {
   elementType = 'dimensionFieldDeclaration';
   typecheckExprValue(expr: ExprValue) {
     typecheckDimension(expr, this);
+    if (this.note) {
+      const {tag} = annotationToTag(this.note);
+      if (tag.tag('spine')?.has('date')) {
+        this.logError(
+          'spine-date-on-dimension',
+          'spine.date is only valid on measures, not dimensions'
+        );
+      }
+    }
   }
 }
 

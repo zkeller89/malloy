@@ -633,7 +633,7 @@ export class Document extends MalloyElement implements NameSpace {
         `Cannot redefine '${str}', which is in global namespace`
       );
     }
-    if (isSourceDef(ent.entry)) {
+    if (isSourceDef(ent.entry) && ent.entry.dialect) {
       this.checkExperimentalDialect(this, ent.entry.dialect);
     }
 

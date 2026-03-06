@@ -21,8 +21,32 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-import type {Annotation, StructDef} from '../../../model/malloy_types';
-import {isPersistableSourceDef} from '../../../model/malloy_types';
+import type {
+  Annotation,
+  Parameter,
+  SpineSourceDef,
+  SpineCompositeDef,
+  SpineFactJoin,
+  SpineGroupSource,
+  SourceDef,
+  StructDef,
+  FieldDef,
+  AtomicFieldDef,
+  Expr,
+} from '../../../model/malloy_types';
+import {
+  isPersistableSourceDef,
+  isSourceDef,
+  isSpineSourceDef,
+  isTemporalType,
+  expressionIsAggregate,
+  expressionIsScalar,
+  mkFieldDef,
+  mkSafeRecord,
+} from '../../../model/malloy_types';
+import {composeSQLExpr} from '../../../model/utils';
+import {annotationToTag} from '../../../annotation';
+import type {ConstantExpression} from '../expressions/constant-expression';
 import {mkSourceID} from '../../../model/source_def_utils';
 import {ErrorFactory} from '../error-factory';
 import type {HasParameter} from '../parameters/has-parameter';
@@ -136,5 +160,297 @@ export class DefineSourceList extends DocStatementList {
   elementType = 'defineSources';
   constructor(sourceList: DefineSource[]) {
     super(sourceList);
+  }
+}
+
+export class DefineSpineSource
+  extends MalloyElement
+  implements DocStatement, Noteable
+{
+  elementType = 'defineSpineSource';
+  readonly isNoteableObj = true;
+  extendNote = extendNoteMethod;
+  note?: Annotation;
+
+  constructor(
+    readonly name: string,
+    readonly exported: boolean,
+    readonly startExpr?: ConstantExpression,
+    readonly endExpr?: ConstantExpression,
+    readonly parameters?: HasParameter[]
+  ) {
+    super();
+    if (startExpr) this.has({startExpr});
+    if (endExpr) this.has({endExpr});
+    if (parameters) this.has({parameters});
+  }
+
+  execute(doc: Document): void {
+    if (doc.modelEntry(this.name)) {
+      this.logError(
+        'source-definition-name-conflict',
+        `Cannot redefine '${this.name}'`
+      );
+      return;
+    }
+    if (!this.startExpr) {
+      this.logError('spine-missing-start', 'spine_source requires a start: property');
+      return;
+    }
+    if (!this.endExpr) {
+      this.logError('spine-missing-end', 'spine_source requires an end: property');
+      return;
+    }
+    const startVal = this.startExpr.constantValue();
+    if (!isTemporalType(startVal.type)) {
+      this.startExpr.logError(
+        'spine-start-must-be-temporal',
+        'start: must be a date or timestamp literal'
+      );
+      return;
+    }
+    const endVal = this.endExpr.constantValue();
+    if (!isTemporalType(endVal.type)) {
+      this.endExpr.logError(
+        'spine-end-must-be-temporal',
+        'end: must be a date or timestamp literal'
+      );
+      return;
+    }
+    const entry: SpineSourceDef = {
+      type: 'spine',
+      name: this.name,
+      fields: [mkFieldDef({type: 'timestamp'}, 'spine_date')],
+      location: this.location,
+      // connection/dialect are not known at definition time; resolved at query time
+      connection: '',
+      dialect: '',
+      spineStart: startVal.value,
+      spineEnd: endVal.value,
+    };
+    if (this.parameters && this.parameters.length > 0) {
+      const params = mkSafeRecord<Parameter>();
+      for (const p of this.parameters) {
+        params[p.name] = p.parameter();
+      }
+      entry.parameters = params;
+    }
+    if (this.note) {
+      entry.annotation = this.note;
+    }
+    doc.setEntry(this.name, {entry, exported: this.exported});
+  }
+}
+
+export class DefineSpineSourceList extends DocStatementList {
+  elementType = 'defineSpineSources';
+  constructor(sourceList: DefineSpineSource[]) {
+    super(sourceList);
+  }
+}
+
+
+export class DefineSpineComposite
+  extends MalloyElement
+  implements DocStatement, Noteable
+{
+  elementType = 'defineSpineComposite';
+  readonly isNoteableObj = true;
+  extendNote = extendNoteMethod;
+  note?: Annotation;
+
+  constructor(
+    readonly name: string,
+    readonly exported: boolean,
+    readonly spineRef: string,
+    readonly joinRefs: string[],
+    readonly parameters?: HasParameter[]
+  ) {
+    super();
+    if (parameters) this.has({parameters});
+  }
+
+  execute(doc: Document): void {
+    if (doc.modelEntry(this.name)) {
+      this.logError(
+        'source-definition-name-conflict',
+        `Cannot redefine '${this.name}'`
+      );
+      return;
+    }
+
+    const spineEntry = doc.modelEntry(this.spineRef)?.entry;
+    if (!spineEntry || !isSpineSourceDef(spineEntry)) {
+      this.logError(
+        'spine-composite-bad-spine',
+        `'${this.spineRef}' is not a spine_source`
+      );
+      return;
+    }
+
+    if (this.joinRefs.length === 0) {
+      this.logError(
+        'spine-composite-missing-spine',
+        'spine_composite requires at least one spine_join:'
+      );
+      return;
+    }
+
+    const factJoins: SpineFactJoin[] = [];
+    const groupSources: SpineGroupSource[] = [];
+    const allGroupFieldNames = new Set<string>();
+    // Map from fieldName → FieldDef, first source wins for dedup
+    const groupFieldDefs = new Map<string, FieldDef>();
+    const measuresAdded = new Set<string>();
+    // modifiedMeasures: measures rewritten to SUM(pre_agg_column) for pre-agg SQL
+    const modifiedMeasures: FieldDef[] = [];
+    // Inherit connection/dialect from the first fact source
+    let inheritedConnection = '';
+    let inheritedDialect = '';
+
+    for (const ref of this.joinRefs) {
+      const entry = doc.modelEntry(ref)?.entry;
+      if (!entry || !isSourceDef(entry)) {
+        this.logError(
+          'spine-composite-bad-fact',
+          `Cannot find source '${ref}'`
+        );
+        return;
+      }
+
+      // Inherit connection/dialect from the first fact source that has one
+      if (inheritedConnection === '' && 'connection' in entry && entry.connection) {
+        inheritedConnection = entry.connection as string;
+        inheritedDialect = (entry as {dialect: string}).dialect ?? '';
+      }
+
+      const groupFields: string[] = [];
+      // Map dateField → list of measure FieldDefs
+      const byDateField = new Map<string, AtomicFieldDef[]>();
+
+      for (const field of entry.fields) {
+        if (!('type' in field && 'name' in field)) continue;
+        const fieldName = (field as AtomicFieldDef).as ?? field.name;
+
+        if (expressionIsScalar((field as AtomicFieldDef).expressionType)) {
+          const tag = annotationToTag((field as AtomicFieldDef).annotation).tag;
+          if (tag.has('spine', 'group')) {
+            groupFields.push(fieldName);
+            allGroupFieldNames.add(fieldName);
+            if (!groupFieldDefs.has(fieldName)) {
+              groupFieldDefs.set(fieldName, field);
+            }
+          }
+        }
+
+        if (expressionIsAggregate((field as AtomicFieldDef).expressionType)) {
+          const tag = annotationToTag((field as AtomicFieldDef).annotation).tag;
+          const dateField = tag.text('spine', 'date');
+          if (dateField) {
+            const dateFieldDef = entry.fields.find(
+              f => ((f as AtomicFieldDef).as ?? f.name) === dateField
+            );
+            if (!dateFieldDef || !isTemporalType(dateFieldDef.type)) {
+              this.logError(
+                'spine-composite-bad-date-field',
+                `## spine.date: '${dateField}' not found or not temporal in '${ref}'`
+              );
+              continue;
+            }
+            const measureList = byDateField.get(dateField) ?? [];
+            measureList.push(field as AtomicFieldDef);
+            byDateField.set(dateField, measureList);
+          }
+        }
+      }
+
+      // One SpineFactJoin per unique dateField used in this source
+      for (const [dateField, measureFields] of byDateField) {
+        const alias = `${ref}__${dateField}`;
+        const measures = measureFields.map(f => f.as ?? f.name);
+        factJoins.push({
+          sourceRef: ref,
+          alias,
+          dateField,
+          measures,
+          groupFields,
+        });
+
+        // Measures become SUM(<pre_agg_column>) in the outer Malloy query.
+        // getStructSourceSQL for spine_composite pre-aggregates each fact join
+        // into a (period, group_dims, measures) subquery; the outer query does
+        // SUM(pre_computed_value) GROUP BY spine_date, groups — which gives the
+        // correct result whether or not there are multiple LEFT JOINs stacked.
+        // generateSumFragment in the expression compiler wraps SUM in COALESCE
+        // automatically, giving 0 for spine dates with no matching fact rows.
+        for (const measureField of measureFields) {
+          const measureName = measureField.as ?? measureField.name;
+          if (measuresAdded.has(measureName)) continue;
+          measuresAdded.add(measureName);
+
+          const modifiedMeasure: AtomicFieldDef = {
+            ...measureField,
+            e: {
+              node: 'aggregate',
+              function: 'sum',
+              // No structPath: the pre-agg column is a top-level column in the
+              // getStructSourceSQL subquery, not accessed via a join alias.
+              e: composeSQLExpr([measureName]) as Expr,
+            } as Expr,
+            fieldUsage: undefined,
+          };
+          modifiedMeasures.push(modifiedMeasure);
+        }
+      }
+
+      if (groupFields.length > 0) {
+        groupSources.push({sourceRef: ref, groupFields});
+      }
+    }
+
+    const fields: FieldDef[] = [
+      mkFieldDef({type: 'timestamp'}, 'spine_date'),
+      // Group fields are bare columns in the base (spine × groups) subquery.
+      // Strip expressions so the compiler generates a plain column reference
+      // rather than trying to evaluate e.g. `carrier_raw` in the composite space.
+      ...[...allGroupFieldNames].map(name => {
+        const orig = groupFieldDefs.get(name)! as AtomicFieldDef;
+        return {type: orig.type, name} as FieldDef;
+      }),
+      ...modifiedMeasures,
+    ];
+
+    const compositeEntry: SpineCompositeDef = {
+      type: 'spine_composite',
+      name: this.name,
+      fields,
+      location: this.location,
+      connection: inheritedConnection,
+      dialect: inheritedDialect,
+      spineSourceRef: this.spineRef,
+      spineFactJoins: factJoins,
+      spineGroupSources: groupSources,
+    };
+
+    if (this.parameters && this.parameters.length > 0) {
+      const params = mkSafeRecord<Parameter>();
+      for (const p of this.parameters) {
+        params[p.name] = p.parameter();
+      }
+      compositeEntry.parameters = params;
+    }
+
+    if (this.note) {
+      compositeEntry.annotation = this.note;
+    }
+
+    doc.setEntry(this.name, {entry: compositeEntry, exported: this.exported});
+  }
+}
+
+export class DefineSpineCompositeList extends DocStatementList {
+  elementType = 'defineSpineComposites';
+  constructor(compositeList: DefineSpineComposite[]) {
+    super(compositeList);
   }
 }

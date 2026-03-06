@@ -422,6 +422,17 @@ type MessageParameterTypes = {
   'missing-required-group-by': string;
   'invalid-partition-composite': string;
   'integer-literal-out-of-range': string;
+  'spine-date-on-dimension': string;
+  'spine-date-missing-field': string;
+  'spine-group-on-measure': string;
+  'spine-missing-start': string;
+  'spine-missing-end': string;
+  'spine-start-must-be-temporal': string;
+  'spine-end-must-be-temporal': string;
+  'spine-composite-bad-spine': string;
+  'spine-composite-bad-fact': string;
+  'spine-composite-bad-date-field': string;
+  'spine-composite-missing-spine': string;
 };
 
 export const MESSAGE_FORMATTERS: PartialErrorCodeMessageMap = {

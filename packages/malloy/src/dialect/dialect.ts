@@ -330,6 +330,23 @@ export abstract class Dialect {
   // return a quoted string for use as a table path.
   abstract quoteTablePath(tablePath: string): string;
 
+  // Generate a subquery expression producing a single spine_date column
+  // covering [start, end] at the given grain (e.g. 'day', 'month', 'year').
+  // Override in dialects that support spine_source.
+  sqlDateSpine(_start: string, _end: string, _grain: string): string {
+    throw new Error(
+      `spine_source is not yet supported for the '${this.name}' dialect`
+    );
+  }
+
+  // Truncates a timestamp SQL expression to the given grain string
+  // (e.g. 'day', 'month').  Override in dialects that support spine_composite.
+  sqlDateTruncExpr(_grain: string, _expr: string): string {
+    throw new Error(
+      `spine_composite is not yet supported for the '${this.name}' dialect`
+    );
+  }
+
   // returns an table that is a 0 based array of numbers
   abstract sqlGroupSetTable(groupSetCount: number): string;
 
