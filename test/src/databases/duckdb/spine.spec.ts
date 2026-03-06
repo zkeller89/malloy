@@ -203,4 +203,51 @@ describe.each(runtimes.runtimeList)('spine:%s', (dbName, runtime) => {
       {event_count: 0},
     ]);
   });
+
+  it('correctly counts two measures on different date fields (no fan-out)', async () => {
+    // Correctness test for pre-aggregation: a source with two ## spine.date measures
+    // produces two SpineFactJoin entries (one per date field). Without pre-agg,
+    // stacking two LEFT JOINs on the same table would create N×M intermediate rows
+    // and overcounting. With pre-agg, each join has at most one row per period.
+    //
+    // fact: 3 events with event_time and 2 events with action_time on 2024-01-01;
+    //       1 event on 2024-01-02 for each field.
+    await expect(`
+      source: dual_events is ${dbName}.sql("""
+        SELECT TIMESTAMP '2024-01-01 10:00:00' as event_time,
+               TIMESTAMP '2024-01-01 08:00:00' as action_time UNION ALL
+        SELECT TIMESTAMP '2024-01-01 12:00:00' as event_time,
+               TIMESTAMP '2024-01-01 09:00:00' as action_time UNION ALL
+        SELECT TIMESTAMP '2024-01-01 15:00:00' as event_time,
+               TIMESTAMP '2024-01-02 10:00:00' as action_time UNION ALL
+        SELECT TIMESTAMP '2024-01-02 11:00:00' as event_time,
+               TIMESTAMP '2024-01-03 14:00:00' as action_time
+      """) extend {
+        # spine.date=event_time
+        measure: event_count is count()
+        # spine.date=action_time
+        measure: action_count is count()
+      }
+
+      spine_source: dual_spine(grain::string) {
+        start: @2024-01-01
+        end: @2024-01-03
+      }
+
+      spine_composite: dual_rollup(grain::string) {
+        spine: dual_spine
+        spine_join: dual_events
+      }
+
+      run: dual_rollup(grain is 'day') -> {
+        group_by: spine_date
+        aggregate: event_count, action_count
+        order_by: spine_date
+      }
+    `).toMatchRows(testModel, [
+      {event_count: 3, action_count: 2},
+      {event_count: 1, action_count: 1},
+      {event_count: 0, action_count: 1},
+    ]);
+  });
 });
