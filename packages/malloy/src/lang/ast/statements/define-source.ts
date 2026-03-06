@@ -32,7 +32,6 @@ import type {
   StructDef,
   FieldDef,
   AtomicFieldDef,
-  AggregateExpr,
   Expr,
 } from '../../../model/malloy_types';
 import {
@@ -42,12 +41,10 @@ import {
   isTemporalType,
   expressionIsAggregate,
   expressionIsScalar,
-  hasExpression,
   mkFieldDef,
   mkSafeRecord,
 } from '../../../model/malloy_types';
 import {composeSQLExpr} from '../../../model/utils';
-import type {SQLExprElement} from '../../../model/utils';
 import {annotationToTag} from '../../../annotation';
 import type {ConstantExpression} from '../expressions/constant-expression';
 import {mkSourceID} from '../../../model/source_def_utils';
@@ -252,35 +249,6 @@ export class DefineSpineSourceList extends DocStatementList {
   }
 }
 
-/**
- * Given a Malloy field name in a source's field list, return the underlying
- * raw SQL column name by recursively following field-reference expressions
- * and renames.  For a plain column `dep_time`, returns `dep_time`.  For
- * `rename: dep_ts is dep_time` and Malloy name `dep_ts`, returns `dep_time`.
- * For `dimension: carrier is carrier_raw` (where carrier_raw is a rename of
- * the SQL column `carrier`), also correctly resolves to `carrier`.
- */
-function resolveRawColumn(
-  fields: FieldDef[],
-  malloyName: string,
-  depth = 0
-): string {
-  if (depth > 10) return malloyName;
-  const field = fields.find(
-    f => ((f as AtomicFieldDef).as ?? f.name) === malloyName
-  ) as AtomicFieldDef | undefined;
-  if (!field) return malloyName;
-  if (!hasExpression(field)) {
-    // Primitive or renamed field: the SQL column name is field.name.
-    return field.name;
-  }
-  const e = field.e;
-  if (e.node === 'field' && e.path.length === 1) {
-    return resolveRawColumn(fields, e.path[0], depth + 1);
-  }
-  // Complex expression — fall back to the Malloy name.
-  return malloyName;
-}
 
 export class DefineSpineComposite
   extends MalloyElement
@@ -334,9 +302,7 @@ export class DefineSpineComposite
     // Map from fieldName → FieldDef, first source wins for dedup
     const groupFieldDefs = new Map<string, FieldDef>();
     const measuresAdded = new Set<string>();
-    // joinEntries: one per SpineFactJoin (a joined table source for the query model)
-    const joinEntries: FieldDef[] = [];
-    // modifiedMeasures: measures with expressions scoped to the join alias
+    // modifiedMeasures: measures rewritten to SUM(pre_agg_column) for pre-agg SQL
     const modifiedMeasures: FieldDef[] = [];
     // Inherit connection/dialect from the first fact source
     let inheritedConnection = '';
@@ -410,122 +376,28 @@ export class DefineSpineComposite
           groupFields,
         });
 
-        // Build the ON expression for the LEFT JOIN using IR field references so
-        // the expression compiler resolves the join alias correctly at SQL-gen time
-        // (getAliasIdentifier() appends _0 etc., so raw SQL strings would be wrong).
-        // DATE_TRUNC(<grain>, alias.dateField) = spine_date [AND alias.g = g ...]
-        const onSrc: SQLExprElement[] = [
-          'DATE_TRUNC(',
-          {node: 'parameter', path: ['grain']} as Expr,
-          ', ',
-          {node: 'field', path: [alias, dateField]} as Expr,
-          ') = ',
-          {node: 'field', path: ['spine_date']} as Expr,
-        ];
-        for (const g of groupFields) {
-          onSrc.push(' AND ');
-          onSrc.push({node: 'field', path: [alias, g]} as Expr);
-          onSrc.push(' = ');
-          onSrc.push({node: 'field', path: [g]} as Expr);
-        }
-        const onExpression = composeSQLExpr(onSrc);
-
-        // Minimal field defs for the join struct so that
-        // {node: 'field', path: [alias, fieldName]} can be resolved by the
-        // expression compiler (getFieldByName navigates into the join's nameMap).
-        // Re-look up dateFieldDef here (it was scoped to the inner field loop).
-        const dateFieldDefForJoin = entry.fields.find(
-          f => ((f as AtomicFieldDef).as ?? f.name) === dateField
-        ) as AtomicFieldDef;
-        // Use the raw SQL column name as `name` (what the compiler emits) and
-        // the Malloy alias as `as` (nameMap lookup key) so that IR field
-        // references like {node:'field', path:[alias, dateField]} resolve to
-        // the correct column even when the field is renamed.
-        const rawDateCol = resolveRawColumn(entry.fields, dateField);
-        const joinFields: FieldDef[] = [
-          {
-            type: dateFieldDefForJoin.type,
-            name: rawDateCol,
-            ...(rawDateCol !== dateField ? {as: dateField} : {}),
-          } as FieldDef,
-          ...groupFields.map(g => {
-            const gDef = entry.fields.find(
-              f => ((f as AtomicFieldDef).as ?? f.name) === g
-            ) as AtomicFieldDef;
-            const rawCol = resolveRawColumn(entry.fields, g);
-            return {
-              type: gDef.type,
-              name: rawCol,
-              ...(rawCol !== g ? {as: g} : {}),
-            } as FieldDef;
-          }),
-        ];
-        // The join entry inherits primaryKey from ...entry. If the fact source
-        // declares a primary key, include it in joinFields so the expression
-        // compiler can resolve it when checking for symmetric aggregation.
-        const pk = (entry as SourceDef).primaryKey;
-        if (pk && !joinFields.some(f => f.name === pk)) {
-          const pkDef = entry.fields.find(
-            f => ((f as AtomicFieldDef).as ?? f.name) === pk
-          ) as AtomicFieldDef | undefined;
-          if (pkDef) {
-            joinFields.push({type: pkDef.type, name: pk} as FieldDef);
-          }
-        }
-
-        // Join entry: copy the fact source's struct def so getStructSourceSQL
-        // can reconstruct the correct SQL (e.g. inline SQL subquery for sql_select).
-        // Override name/as with the alias and add join properties.
-        const joinEntry: FieldDef = {
-          ...entry,
-          name: alias,
-          as: alias,
-          join: 'many',
-          matrixOperation: 'left',
-          onExpression,
-          fields: joinFields,
-        } as unknown as FieldDef;
-        joinEntries.push(joinEntry);
-
-        // Modified measures: convert count() to sum(CASE WHEN dateField IS NOT NULL THEN 1 ELSE 0 END)
-        // Other aggregates: keep their function but scope field references to the join alias
+        // Measures become SUM(<pre_agg_column>) in the outer Malloy query.
+        // getStructSourceSQL for spine_composite pre-aggregates each fact join
+        // into a (period, group_dims, measures) subquery; the outer query does
+        // SUM(pre_computed_value) GROUP BY spine_date, groups — which gives the
+        // correct result whether or not there are multiple LEFT JOINs stacked.
+        // generateSumFragment in the expression compiler wraps SUM in COALESCE
+        // automatically, giving 0 for spine dates with no matching fact rows.
         for (const measureField of measureFields) {
           const measureName = measureField.as ?? measureField.name;
           if (measuresAdded.has(measureName)) continue;
           measuresAdded.add(measureName);
 
-          const origExpr = measureField.e as AggregateExpr | undefined;
-          let newExpr: Expr;
-          if (origExpr && origExpr.node === 'aggregate' && origExpr.function === 'count') {
-            // Convert count() to sum(CASE WHEN alias.dateField IS NOT NULL THEN 1 ELSE 0 END)
-            newExpr = {
-              node: 'aggregate',
-              function: 'sum',
-              structPath: [alias],
-              e: {
-                node: 'case',
-                kids: {
-                  caseWhen: [composeSQLExpr([{node: 'field', path: [alias, dateField]} as Expr, ' IS NOT NULL']) as Expr],
-                  caseThen: [{node: 'numberLiteral', literal: '1'} as Expr],
-                  caseElse: {node: 'numberLiteral', literal: '0'} as Expr,
-                },
-              },
-            } as Expr;
-          } else if (origExpr && origExpr.node === 'aggregate') {
-            // For other aggregates (sum, avg, etc.), add structPath to scope to the join alias
-            newExpr = {
-              ...origExpr,
-              structPath: [alias],
-            } as Expr;
-          } else {
-            newExpr = origExpr as Expr;
-          }
-
           const modifiedMeasure: AtomicFieldDef = {
             ...measureField,
-            e: newExpr,
-            // fieldUsage tells the query model which join this measure depends on
-            fieldUsage: [{path: [alias], uniqueKeyRequirement: {isCount: false}}],
+            e: {
+              node: 'aggregate',
+              function: 'sum',
+              // No structPath: the pre-agg column is a top-level column in the
+              // getStructSourceSQL subquery, not accessed via a join alias.
+              e: composeSQLExpr([measureName]) as Expr,
+            } as Expr,
+            fieldUsage: undefined,
           };
           modifiedMeasures.push(modifiedMeasure);
         }
@@ -545,7 +417,6 @@ export class DefineSpineComposite
         const orig = groupFieldDefs.get(name)! as AtomicFieldDef;
         return {type: orig.type, name} as FieldDef;
       }),
-      ...joinEntries,
       ...modifiedMeasures,
     ];
 

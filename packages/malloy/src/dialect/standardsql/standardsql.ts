@@ -136,6 +136,10 @@ export class StandardSQLDialect extends Dialect {
     {min: MIN_INT64, max: MAX_INT64, numberType: 'bigint'},
   ];
 
+  override sqlDateTruncExpr(grain: string, expr: string): string {
+    return `TIMESTAMP_TRUNC(${expr}, ${grain.toUpperCase()})`;
+  }
+
   override sqlDateSpine(start: string, end: string, grain: string): string {
     const unit = grain.toUpperCase();
     return (

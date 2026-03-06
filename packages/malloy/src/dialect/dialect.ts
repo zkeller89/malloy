@@ -339,6 +339,14 @@ export abstract class Dialect {
     );
   }
 
+  // Truncates a timestamp SQL expression to the given grain string
+  // (e.g. 'day', 'month').  Override in dialects that support spine_composite.
+  sqlDateTruncExpr(_grain: string, _expr: string): string {
+    throw new Error(
+      `spine_composite is not yet supported for the '${this.name}' dialect`
+    );
+  }
+
   // returns an table that is a 0 based array of numbers
   abstract sqlGroupSetTable(groupSetCount: number): string;
 
