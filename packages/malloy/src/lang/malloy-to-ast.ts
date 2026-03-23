@@ -423,7 +423,11 @@ export class MalloyToAST
           itemCx
         );
       } else if (itemCx instanceof SpineCompositeFactJoinContext) {
-        const sourceRef = getId(itemCx);
+        const ids = itemCx.id();
+        // spine_join: alias is source { ... }  → ids[0]=alias, ids[1]=sourceRef
+        // spine_join: source { ... }            → ids[0]=sourceRef, alias=sourceRef
+        const alias = idToStr(ids[0]);
+        const sourceRef = ids.length > 1 ? idToStr(ids[1]) : alias;
         let dateField: string | undefined;
         const groupFields: {alias: string; column: string}[] = [];
         for (const joinItemCx of itemCx.spineJoinBody().spineJoinItem()) {
@@ -443,7 +447,7 @@ export class MalloyToAST
             `spine_join '${sourceRef}' is missing spine_date:`
           );
         } else {
-          joinSpecs.push({sourceRef, dateField, groupFields});
+          joinSpecs.push({alias, sourceRef, dateField, groupFields});
         }
       }
     }

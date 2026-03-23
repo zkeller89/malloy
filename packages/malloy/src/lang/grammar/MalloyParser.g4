@@ -49,7 +49,7 @@ spineCompositeBody
 spineCompositeItem
   : SPINE_START_KW fieldExpr                               # spineCompositeStart
   | SPINE_END_KW fieldExpr                                 # spineCompositeEnd
-  | SPINE_JOIN_KW id OCURLY spineJoinBody CCURLY           # spineCompositeFactJoin
+  | SPINE_JOIN_KW id (IS id)? OCURLY spineJoinBody CCURLY  # spineCompositeFactJoin
   ;
 
 spineJoinBody

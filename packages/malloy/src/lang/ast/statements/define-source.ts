@@ -157,6 +157,7 @@ export class DefineSourceList extends DocStatementList {
 
 /** One spine_join: entry as parsed from the grammar. */
 export interface SpineJoinSpec {
+  alias: string;    // user-facing name (from 'spine_join: alias is source' or defaults to sourceRef)
   sourceRef: string;
   dateField: string; // value of spine_date: (physical column name)
   groupFields: SpineGroupField[]; // spine_group: entries with alias + column
@@ -245,7 +246,7 @@ export class DefineSpineComposite
     for (const spec of this.joinSpecs) {
       factJoins.push({
         sourceRef: spec.sourceRef,
-        alias: `${spec.sourceRef}__${spec.dateField}`,
+        alias: spec.alias,
         dateField: spec.dateField,
         groupFields: spec.groupFields,
       });
