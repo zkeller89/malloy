@@ -189,4 +189,16 @@ export abstract class PostgresBase extends Dialect {
 
     return truncated;
   }
+
+  sqlDateSpineSQL(start: string, end: string, grain: string): string {
+    return (
+      `SELECT UNNEST(generate_series(` +
+      `'${start}'::TIMESTAMP, '${end}'::TIMESTAMP, INTERVAL '1' ${grain}` +
+      `)) AS spine_date`
+    );
+  }
+
+  sqlDateTruncToGrain(grain: string, expr: string): string {
+    return `DATE_TRUNC('${grain}', ${expr})`;
+  }
 }

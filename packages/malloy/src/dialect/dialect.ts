@@ -424,6 +424,22 @@ export abstract class Dialect {
   }
 
   abstract sqlNowExpr(): string;
+
+  /**
+   * Returns a SQL subquery (without surrounding parens) that generates one
+   * row per period between `start` and `end` at the given `grain`.
+   * The generated column must be aliased as `spine_date`.
+   * `start` and `end` are date/timestamp literals (e.g. '@2020-01-01').
+   * `grain` is a runtime string (e.g. 'day', 'month').
+   */
+  abstract sqlDateSpineSQL(start: string, end: string, grain: string): string;
+
+  /**
+   * Returns a SQL expression that truncates `expr` to the given `grain`.
+   * `grain` is a runtime string (e.g. 'day', 'month', 'week').
+   */
+  abstract sqlDateTruncToGrain(grain: string, expr: string): string;
+
   abstract sqlTimeExtractExpr(qi: QueryInfo, xFrom: TimeExtractExpr): string;
   abstract sqlMeasureTimeExpr(e: MeasureTimeExpr): string;
   /**
