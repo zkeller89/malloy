@@ -300,6 +300,14 @@ type MessageParameterTypes = {
   'source-definition-name-conflict': string;
   'parameter-name-conflict': string;
   'parameter-shadowing-field': string;
+  'spine-source-bad-start': string;
+  'spine-source-bad-end': string;
+  'spine-composite-bad-spine': string;
+  'spine-composite-bad-fact': string;
+  'spine-composite-bad-group': string;
+  'spine-composite-bad-date-field': string;
+  'spine-composite-bad-start': string;
+  'spine-composite-bad-end': string;
   'invalid-import-url': string;
   'no-translator-for-import': string;
   'name-conflict-on-selective-import': string;
