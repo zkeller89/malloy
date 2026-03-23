@@ -29,12 +29,36 @@ malloyDocument: (malloyStatement | SEMI)* EOF;
 
 malloyStatement
   : defineSourceStatement
+  | defineSpineCompositeStatement
   | defineQuery
   | importStatement
   | runStatement
   | docAnnotations
   | ignoredObjectAnnotations
   | experimentalStatementForTesting
+  ;
+
+defineSpineCompositeStatement
+  : tags SPINE_COMPOSITE sourceNameDef sourceParameters? OCURLY spineCompositeBody CCURLY
+  ;
+
+spineCompositeBody
+  : spineCompositeItem*
+  ;
+
+spineCompositeItem
+  : SPINE_START_KW fieldExpr                               # spineCompositeStart
+  | SPINE_END_KW fieldExpr                                 # spineCompositeEnd
+  | SPINE_JOIN_KW id OCURLY spineJoinBody CCURLY           # spineCompositeFactJoin
+  ;
+
+spineJoinBody
+  : spineJoinItem*
+  ;
+
+spineJoinItem
+  : SPINE_DATE_KW id                    # spineJoinDate
+  | SPINE_GROUP_KW id (IS id)?          # spineJoinGroup
   ;
 
 defineSourceStatement
