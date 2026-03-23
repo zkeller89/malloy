@@ -116,6 +116,82 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
     );
   });
 
+  it('named measure via fact join alias: dep_flights.dep_count', async () => {
+    // dep_count is count() in the flights source — after pre-aggregation it should
+    // equal the actual count of fact rows in each (month, category) cell.
+    await expect(`
+      ##! experimental { composite_sources parameters }
+      source: events2 is duckdb.sql("""
+        SELECT * FROM (VALUES
+          ('A', TIMESTAMP '2020-01-15'),
+          ('A', TIMESTAMP '2020-01-28'),
+          ('B', TIMESTAMP '2020-01-25')
+        ) t(category, event_date)
+      """) extend {
+        measure: evt_count is count()
+      }
+      spine_composite: named_measure_spine(grain::string) {
+        spine_start: @2020-01-01
+        spine_end: @2020-02-28
+        spine_join: dep is events2 {
+          spine_date: event_date
+          spine_group: category
+        }
+      }
+      run: named_measure_spine(grain is 'month') -> {
+        group_by: spine_date, category
+        aggregate: cnt is dep.evt_count
+        order_by: spine_date, category
+      }
+    `).toMatchResult(
+      testModel,
+      // Jan: A has 2 events, B has 1
+      {category: 'A', cnt: 2},
+      {category: 'B', cnt: 1},
+      // Feb: zero-fill — COALESCE produces 0 (no events in Feb)
+      {category: 'A', cnt: 0},
+      {category: 'B', cnt: 0}
+    );
+  });
+
+  it('two fact joins on same source: no fan-out', async () => {
+    // When two spine_join entries reference the same fact table, aggregates must
+    // NOT be inflated by a Cartesian product.  dep + arr each have 2 rows in Jan;
+    // wrong fan-out would give 4 instead of 2 for each.
+    await expect(`
+      ##! experimental { composite_sources parameters }
+      source: events3 is duckdb.sql("""
+        SELECT * FROM (VALUES
+          ('A', TIMESTAMP '2020-01-10', TIMESTAMP '2020-01-11'),
+          ('A', TIMESTAMP '2020-01-20', TIMESTAMP '2020-01-21')
+        ) t(category, dep_date, arr_date)
+      """) extend {
+        measure: evt_count is count()
+      }
+      spine_composite: fanout_spine(grain::string) {
+        spine_start: @2020-01-01
+        spine_end: @2020-01-31
+        spine_join: dep_flights is events3 {
+          spine_date: dep_date
+          spine_group: category
+        }
+        spine_join: arr_flights is events3 {
+          spine_date: arr_date
+          spine_group: category
+        }
+      }
+      run: fanout_spine(grain is 'month') -> {
+        group_by: category
+        aggregate:
+          deps is dep_flights.evt_count,
+          arrs is arr_flights.evt_count
+      }
+    `).toMatchResult(
+      testModel,
+      {category: 'A', deps: 2, arrs: 2}
+    );
+  });
+
   it('no spine_group: produces one row per date period', async () => {
     // Without groups, spine is just a date series
     await expect(`
