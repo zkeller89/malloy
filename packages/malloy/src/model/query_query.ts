@@ -31,7 +31,9 @@ import type {
   Query,
   PrepareResultOptions,
   SpineJoinDef,
+  SpineFactJoin,
   StringLiteralNode,
+  SourceDef,
 } from './malloy_types';
 import {
   isRawSegment,
@@ -39,6 +41,7 @@ import {
   isQuerySegment,
   hasExpression,
   isAtomic,
+  expressionIsAggregate,
   expressionIsCalculation,
   expressionIsScalar,
   getIdentifier,
@@ -794,7 +797,7 @@ export class QueryQuery extends QueryField {
         }
         const allGroupAliases = [...seenAliases];
 
-        // Build spine × groups CROSS JOIN
+        // Build spine × groups CROSS JOIN (grid only; fact joins are outer LEFT JOINs)
         let baseSQL: string;
         if (allGroupAliases.length > 0) {
           const groupUnions = def.spineFactJoins
@@ -820,29 +823,7 @@ export class QueryQuery extends QueryField {
           baseSQL = `SELECT spine_date FROM (${spineSQL}) AS __spine`;
         }
 
-        // Build LEFT JOINs to fact tables (one per spine_join spec)
-        const joinLines = def.spineFactJoins.map(fj => {
-          const factStruct = this.structRefToQueryStruct(fj.sourceRef);
-          if (!factStruct) {
-            throw new Error(
-              `spine_composite: unknown source '${fj.sourceRef}'`
-            );
-          }
-          const factSQL = this.getStructSourceSQL(factStruct, stageWriter);
-          const truncExpr = this.parent.dialect.sqlDateTruncToGrain(
-            grain,
-            `${fj.alias}.${fj.dateField}`
-          );
-          const dateCond = `${truncExpr} = __spine.spine_date`;
-          const groupConds = fj.groupFields
-            .map(gf => `${fj.alias}.${gf.column} = __groups.${gf.alias}`)
-            .join(' AND ');
-          const onCond = [dateCond, groupConds].filter(Boolean).join(' AND ');
-          return `LEFT JOIN ${factSQL} AS ${fj.alias} ON ${onCond}`;
-        });
-
-        const innerSQL = [baseSQL, ...joinLines].join('\n');
-        return `(\n${innerSQL}\n)`;
+        return `(\n${baseSQL}\n)`;
       }
       case 'finalize':
         return qs.structDef.name;
@@ -986,6 +967,52 @@ export class QueryQuery extends QueryField {
     };
   }
 
+  /**
+   * Build pre-aggregated SELECT column expressions for a spine fact join.
+   * For each aggregate field in the fact source, generates a SQL aggregate
+   * expression aliased as __preagg_<fieldName> (the shadow column consumed by
+   * the redefined SUM measures in the SpineJoinDef JoinFieldDef).
+   */
+  buildSpinePreAggCols(factDef: SourceDef, _factJoin: SpineFactJoin): string[] {
+    const cols: string[] = [];
+    for (const f of factDef.fields) {
+      if (!isAtomic(f)) continue;
+      // AtomicFieldDef has Expression fields (e, expressionType) from FieldBase
+      const af = f as FieldDef & {
+        name: string;
+        as?: string;
+        expressionType?: import('./malloy_types').ExpressionType;
+        e?: {
+          node: string;
+          function?: string;
+          e?: {node: string; path?: string[]};
+        };
+      };
+      if (!expressionIsAggregate(af.expressionType)) continue;
+      const colName = af.as ?? af.name;
+      const preaggName = `__preagg_${colName}`;
+      const e = af.e;
+      if (!e) continue;
+      if (e.node === 'aggregate') {
+        if (e.function === 'count') {
+          cols.push(`COUNT(*) AS ${preaggName}`);
+        } else if (e.function === 'sum' || e.function === 'avg') {
+          const innerE = e.e;
+          if (
+            innerE?.node === 'field' &&
+            Array.isArray(innerE.path) &&
+            innerE.path.length === 1
+          ) {
+            const fn = e.function.toUpperCase();
+            cols.push(`${fn}(${innerE.path[0]}) AS ${preaggName}`);
+          }
+        }
+        // max/min/distinct: skip — too complex for simple pre-agg SQL
+      }
+    }
+    return cols;
+  }
+
   generateSQLJoinBlock(
     stageWriter: StageWriter,
     ji: JoinInstance,
@@ -994,6 +1021,75 @@ export class QueryQuery extends QueryField {
     let s = '';
     const qs = ji.queryStruct;
     const qsDef = qs.structDef;
+
+    // Intercept spine fact joins: generate a pre-aggregated subquery LEFT JOIN
+    // instead of the raw table join, avoiding fan-out when multiple fact joins are used.
+    const parentStructDef = qs.parent?.structDef;
+    if (parentStructDef?.type === 'spine_join') {
+      const spineDef = parentStructDef as SpineJoinDef;
+      const factJoin = spineDef.spineFactJoins.find(
+        fj => fj.alias === getIdentifier(qsDef)
+      );
+      if (factJoin) {
+        // Extract grain (same grain parameter as the composite source)
+        const grainArg = qs.parent!.arguments()['grain'];
+        const grainVal = grainArg?.value;
+        const grain =
+          grainVal &&
+          'node' in grainVal &&
+          (grainVal as StringLiteralNode).node === 'stringLiteral'
+            ? (grainVal as StringLiteralNode).literal
+            : 'day';
+
+        // Original fact source SQL (unwrapped table / SQL select)
+        const factStruct = this.structRefToQueryStruct(factJoin.sourceRef);
+        if (!factStruct) {
+          throw new Error(
+            `spine_composite: unknown source '${factJoin.sourceRef}'`
+          );
+        }
+        const rawFactSQL = this.getStructSourceSQL(factStruct, stageWriter);
+        const factDef = factStruct.structDef as SourceDef;
+
+        // Build pre-aggregated SELECT:
+        //   DATE_TRUNC(grain, dateField) AS spine_date
+        //   group dimension columns
+        //   __preagg_<measure> aggregate expressions
+        //   1 AS __distinct_key  (so count() yields 0 or 1 per grid cell)
+        const truncExpr = this.parent.dialect.sqlDateTruncToGrain(
+          grain,
+          factJoin.dateField
+        );
+        const preaggCols = this.buildSpinePreAggCols(factDef, factJoin);
+        const selectCols = [
+          `${truncExpr} AS spine_date`,
+          ...factJoin.groupFields.map(gf => `${gf.column} AS ${gf.alias}`),
+          ...preaggCols,
+          `1 AS __distinct_key`,
+        ];
+        const groupCols = [
+          'spine_date',
+          ...factJoin.groupFields.map(gf => gf.alias),
+        ];
+        const preAggSQL =
+          `(SELECT ${selectCols.join(', ')}\n` +
+          `FROM ${rawFactSQL}\n` +
+          `GROUP BY ${groupCols.join(', ')})`;
+
+        // Parent alias is the spine base grid's SQL alias
+        const parentAlias = ji.parent?.alias ?? '';
+        const dateCond = `${ji.alias}.spine_date = ${parentAlias}.spine_date`;
+        const groupConds = factJoin.groupFields
+          .map(gf => `${ji.alias}.${gf.alias} = ${parentAlias}.${gf.alias}`)
+          .join(' AND ');
+        const onCond = [dateCond, groupConds].filter(Boolean).join(' AND ');
+
+        qs.eventStream?.emit('join-used', {name: getIdentifier(qsDef)});
+        qs.maybeEmitParameterizedSourceUsage();
+        return ` LEFT JOIN ${preAggSQL} AS ${ji.alias}\n  ON ${onCond}\n`;
+      }
+    }
+
     qs.eventStream?.emit('join-used', {name: getIdentifier(qsDef)});
     qs.maybeEmitParameterizedSourceUsage();
     if (isJoinedSource(qsDef)) {

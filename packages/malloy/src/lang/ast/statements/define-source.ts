@@ -25,13 +25,19 @@ import type {
   Annotation,
   AtomicFieldDef,
   CompositeSourceDef,
+  Expr,
+  FieldDef,
+  JoinFieldDef,
   Parameter,
+  SourceDef,
   SpineFactJoin,
   SpineGroupField,
   SpineJoinDef,
   StructDef,
 } from '../../../model/malloy_types';
 import {
+  expressionIsAggregate,
+  isAtomic,
   isPersistableSourceDef,
   isSourceDef,
   isTimeLiteral,
@@ -283,10 +289,77 @@ export class DefineSpineComposite
     // The CompositeSourceDef.fields must use {node: 'compositeField'} so that
     // getNonCompositeFields() returns [] and avoids duplicating fields from SpineJoinDef
     // when composite resolution merges nonCompositeFields with sub-source fields.
-    const compositeFields: AtomicFieldDef[] = spineJoinDef.fields.map(f => ({
+    // Start with composite versions of the atomic spine fields (spine_date + group dims).
+    const compositeFields: FieldDef[] = spineJoinDef.fields.map(f => ({
       ...(f as AtomicFieldDef),
       e: {node: 'compositeField' as const},
     }));
+
+    // 6b. Add each fact join as a JoinFieldDef in SpineJoinDef.fields so that
+    //     dep_flights.field is resolvable in the field space.  Aggregate fields are
+    //     redefined to SUM(__preagg_<name>) so they match the pre-aggregated subquery
+    //     generated at SQL-gen time (no fan-out, correct values).
+    for (const spec of this.joinSpecs) {
+      const factDef = doc.modelEntry(spec.sourceRef)?.entry as SourceDef;
+      if (!factDef || !isSourceDef(factDef)) continue;
+
+      // Build the redefined field list for the join:
+      //   - Dimensions: kept as-is
+      //   - Aggregate measures: replaced with SUM(__preagg_<name>) pair
+      const redefinedFields: FieldDef[] = [];
+      for (const f of factDef.fields) {
+        if (!isAtomic(f)) continue;
+        const af = f as AtomicFieldDef;
+        if (expressionIsAggregate(af.expressionType)) {
+          // Intrinsic (no expression) shadow column that the pre-agg subquery outputs
+          const preaggName = `__preagg_${af.as ?? af.name}`;
+          redefinedFields.push({type: af.type, name: preaggName} as AtomicFieldDef);
+          // Measure defined as SUM of the shadow column — avoids self-referential recursion
+          redefinedFields.push({
+            ...af,
+            e: {
+              node: 'aggregate',
+              function: 'sum',
+              e: {node: 'field', path: [preaggName]},
+            } as Expr,
+          });
+        } else {
+          redefinedFields.push(af);
+        }
+      }
+
+      // JoinFieldDef embedded in SpineJoinDef.fields for field-space resolution
+      const joinField = {
+        ...factDef,
+        name: spec.alias,
+        as: undefined,
+        join: 'many' as const,
+        matrixOperation: 'left' as const,
+        onExpression: undefined,
+        fields: redefinedFields,
+      } as JoinFieldDef;
+      spineJoinDef.fields.push(joinField as FieldDef);
+
+      // Composite mirror: type:'composite' ensures getNonCompositeFields() skips it
+      // so composite resolution doesn't double-add the join's fields.
+      const compositeJoinField = {
+        ...factDef,
+        type: 'composite' as const,
+        name: spec.alias,
+        as: undefined,
+        join: 'many' as const,
+        matrixOperation: 'left' as const,
+        onExpression: undefined,
+        sources: [],
+        fields: factDef.fields
+          .filter(isAtomic)
+          .map(f => ({
+            ...(f as AtomicFieldDef),
+            e: {node: 'compositeField' as const},
+          })),
+      } as FieldDef;
+      compositeFields.push(compositeJoinField);
+    }
     const entry: CompositeSourceDef = {
       type: 'composite',
       name: this.name,
