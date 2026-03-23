@@ -30,6 +30,8 @@ import type {
   UniqueKeyRequirement,
   Query,
   PrepareResultOptions,
+  SpineJoinDef,
+  StringLiteralNode,
 } from './malloy_types';
 import {
   isRawSegment,
@@ -767,6 +769,81 @@ export class QueryQuery extends QueryField {
         // TODO: throw an error here; not simple because we call into this
         // code currently before the composite source is resolved in some cases
         return '{COMPOSITE SOURCE}';
+      case 'spine_join': {
+        const def = qs.structDef as SpineJoinDef;
+        // Extract grain from runtime arguments (defaults to 'day')
+        const grainArg = qs.arguments()['grain'];
+        const grainVal = grainArg?.value;
+        const grain =
+          grainVal &&
+          'node' in grainVal &&
+          (grainVal as StringLiteralNode).node === 'stringLiteral'
+            ? (grainVal as StringLiteralNode).literal
+            : 'day';
+
+        const spineSQL = this.parent.dialect.sqlDateSpineSQL(
+          def.spineStart,
+          def.spineEnd,
+          grain
+        );
+
+        // Collect unique group aliases across all fact joins
+        const seenAliases = new Set<string>();
+        for (const fj of def.spineFactJoins) {
+          for (const gf of fj.groupFields) seenAliases.add(gf.alias);
+        }
+        const allGroupAliases = [...seenAliases];
+
+        // Build spine × groups CROSS JOIN
+        let baseSQL: string;
+        if (allGroupAliases.length > 0) {
+          const groupUnions = def.spineFactJoins
+            .filter(fj => fj.groupFields.length > 0)
+            .map(fj => {
+              const factStruct = this.structRefToQueryStruct(fj.sourceRef);
+              if (!factStruct) {
+                throw new Error(
+                  `spine_composite: unknown source '${fj.sourceRef}'`
+                );
+              }
+              const factSQL = this.getStructSourceSQL(factStruct, stageWriter);
+              const cols = fj.groupFields
+                .map(gf => `${gf.column} AS ${gf.alias}`)
+                .join(', ');
+              return `SELECT DISTINCT ${cols} FROM ${factSQL}`;
+            });
+          baseSQL =
+            `SELECT __spine.spine_date, __groups.*\n` +
+            `FROM (${spineSQL}) AS __spine\n` +
+            `CROSS JOIN (\n${groupUnions.join('\nUNION ALL\n')}\n) AS __groups`;
+        } else {
+          baseSQL = `SELECT spine_date FROM (${spineSQL}) AS __spine`;
+        }
+
+        // Build LEFT JOINs to fact tables (one per spine_join spec)
+        const joinLines = def.spineFactJoins.map(fj => {
+          const factStruct = this.structRefToQueryStruct(fj.sourceRef);
+          if (!factStruct) {
+            throw new Error(
+              `spine_composite: unknown source '${fj.sourceRef}'`
+            );
+          }
+          const factSQL = this.getStructSourceSQL(factStruct, stageWriter);
+          const truncExpr = this.parent.dialect.sqlDateTruncToGrain(
+            grain,
+            `${fj.alias}.${fj.dateField}`
+          );
+          const dateCond = `${truncExpr} = __spine.spine_date`;
+          const groupConds = fj.groupFields
+            .map(gf => `${fj.alias}.${gf.column} = __groups.${gf.alias}`)
+            .join(' AND ');
+          const onCond = [dateCond, groupConds].filter(Boolean).join(' AND ');
+          return `LEFT JOIN ${factSQL} AS ${fj.alias} ON ${onCond}`;
+        });
+
+        const innerSQL = [baseSQL, ...joinLines].join('\n');
+        return `(\n${innerSQL}\n)`;
+      }
       case 'finalize':
         return qs.structDef.name;
       case 'sql_select':

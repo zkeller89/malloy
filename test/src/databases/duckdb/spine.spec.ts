@@ -1,0 +1,141 @@
+/*
+ * Copyright 2024 Google LLC
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining
+ * a copy of this software and associated documentation files
+ * (the "Software"), to deal in the Software without restriction,
+ * including without limitation the rights to use, copy, modify, merge,
+ * publish, distribute, sublicense, and/or sell copies of the Software,
+ * and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+import {describeIfDatabaseAvailable} from '../../util';
+import {RuntimeList} from '../../runtimes';
+import '@malloydata/malloy/test/matchers';
+import {wrapTestModel} from '@malloydata/malloy/test';
+
+const [describe, databases] = describeIfDatabaseAvailable(['duckdb']);
+const runtimes = new RuntimeList(databases);
+
+afterAll(async () => {
+  await runtimes.closeAll();
+});
+
+describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
+  const testModel = wrapTestModel(runtime, '');
+
+  const eventSource = `
+    source: events is duckdb.sql("""
+      SELECT * FROM (VALUES
+        ('A', TIMESTAMP '2020-01-15'),
+        ('A', TIMESTAMP '2020-02-10'),
+        ('B', TIMESTAMP '2020-01-25')
+      ) t(category, event_date)
+    """)
+  `;
+
+  const spineComposite = `
+    ##! experimental { composite_sources parameters }
+    ${eventSource}
+    spine_composite: monthly_spine(grain::string) {
+      spine_start: @2020-01-01
+      spine_end: @2020-03-31
+      spine_join: events {
+        spine_date: event_date
+        spine_group: category
+      }
+    }
+  `;
+
+  it('zero-fill: produces rows for all (date, group) combinations', async () => {
+    // category B has no February or March events; spine should fill them in
+    // so both A and B have 3 month rows (Jan, Feb, Mar)
+    await expect(`
+      ${spineComposite}
+      run: monthly_spine(grain is 'month') -> {
+        group_by: category
+        aggregate: month_count is count()
+        order_by: category
+      }
+    `).toMatchResult(
+      testModel,
+      {category: 'A', month_count: 3},
+      {category: 'B', month_count: 3}
+    );
+  });
+
+  it('total rows equals date_count × group_count', async () => {
+    // 3 months × 2 categories = 6 rows total
+    await expect(`
+      ${spineComposite}
+      run: monthly_spine(grain is 'month') -> {
+        aggregate: total_rows is count()
+      }
+    `).toMatchResult(testModel, {total_rows: 6});
+  });
+
+  it('federated group alias: spine_group with is-rename', async () => {
+    // Verify alias mapping: spine_group: group_alias is source_column
+    await expect(`
+      ##! experimental { composite_sources parameters }
+      source: items is duckdb.sql("""
+        SELECT * FROM (VALUES
+          ('x', TIMESTAMP '2021-01-10'),
+          ('y', TIMESTAMP '2021-02-15')
+        ) t(item_code, ts)
+      """)
+      spine_composite: item_spine(grain::string) {
+        spine_start: @2021-01-01
+        spine_end: @2021-02-28
+        spine_join: items {
+          spine_date: ts
+          spine_group: grp is item_code
+        }
+      }
+      run: item_spine(grain is 'month') -> {
+        group_by: grp
+        aggregate: row_count is count()
+        order_by: grp
+      }
+    `).toMatchResult(
+      testModel,
+      {grp: 'x', row_count: 2},
+      {grp: 'y', row_count: 2}
+    );
+  });
+
+  it('no spine_group: produces one row per date period', async () => {
+    // Without groups, spine is just a date series
+    await expect(`
+      ##! experimental { composite_sources parameters }
+      source: simple_events is duckdb.sql("""
+        SELECT * FROM (VALUES
+          (TIMESTAMP '2022-06-15'),
+          (TIMESTAMP '2022-08-20')
+        ) t(ts)
+      """)
+      spine_composite: date_spine(grain::string) {
+        spine_start: @2022-06-01
+        spine_end: @2022-08-31
+        spine_join: simple_events {
+          spine_date: ts
+        }
+      }
+      run: date_spine(grain is 'month') -> {
+        aggregate: month_count is count()
+      }
+    `).toMatchResult(testModel, {month_count: 3});
+  });
+});
