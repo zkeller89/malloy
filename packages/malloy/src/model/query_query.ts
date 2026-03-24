@@ -42,6 +42,8 @@ import type {
   UnaryExpr,
   FieldnameNode,
   SourceDef,
+  AggregateExpr,
+  JoinBase,
 } from './malloy_types';
 import {
   isRawSegment,
@@ -161,6 +163,9 @@ export class QueryQuery extends QueryField {
   // query_query doesn't have to include query_model because query_model
   // needs to include query_query. don't love this solution
   protected structRefToQueryStruct: (name: string) => QueryStruct | undefined;
+  // Maps spine pre-agg join QueryStruct → raw column names that need SUM(col) AS __preagg_col
+  // in the pre-agg subquery. Populated by scanForSpineRawColSums() before SQL generation.
+  private spineExtraRawCols?: Map<QueryStruct, Set<string>>;
 
   constructor(
     fieldDef: TurtleDef,
@@ -1136,6 +1141,68 @@ export class QueryQuery extends QueryField {
     return cols;
   }
 
+  /**
+   * Walk an Expr tree looking for `sum(structPath.col)` calls on spine pre-agg
+   * joins where `col` is a raw (non-preagg) column. Registers found columns in
+   * `spineExtraRawCols` so `generateSQLJoinBlock` can include them in the pre-agg SELECT.
+   */
+  private walkExprForSpineRawSums(expr: Expr | undefined): void {
+    if (!expr) return;
+    if (expr.node === 'aggregate' && (expr as AggregateExpr).function === 'sum') {
+      const agg = expr as AggregateExpr;
+      if (agg.e?.node === 'field') {
+        const path = (agg.e as FieldnameNode).path;
+        if (path && path.length >= 1) {
+          const col = path[path.length - 1];
+          if (!col.startsWith('__preagg_')) {
+            const structPath =
+              agg.structPath && agg.structPath.length > 0
+                ? agg.structPath
+                : path.length >= 2
+                  ? path.slice(0, -1)
+                  : undefined;
+            let struct: QueryStruct | undefined;
+            if (structPath) {
+              try { struct = this.parent.getStructByName(structPath); } catch { /* ignore */ }
+            }
+            if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+              if (!this.spineExtraRawCols) this.spineExtraRawCols = new Map();
+              let set = this.spineExtraRawCols.get(struct);
+              if (!set) {
+                set = new Set();
+                this.spineExtraRawCols.set(struct, set);
+              }
+              set.add(col);
+            }
+          }
+        }
+      }
+    }
+    // Recurse into standard child expression slots
+    const e = expr as unknown as Record<string, unknown>;
+    const inner = e['e'];
+    if (inner && typeof inner === 'object' && 'node' in (inner as object)) {
+      this.walkExprForSpineRawSums(inner as Expr);
+    }
+    const kids = e['kids'];
+    if (kids && typeof kids === 'object') {
+      for (const child of Object.values(kids as Record<string, unknown>)) {
+        if (child && typeof child === 'object' && 'node' in (child as object)) {
+          this.walkExprForSpineRawSums(child as Expr);
+        }
+      }
+    }
+  }
+
+  /** Pre-scan all result fields for raw column .sum() calls on spine pre-agg joins. */
+  private scanForSpineRawColSums(): void {
+    for (const [, fi] of this.rootResult.allFields) {
+      if (fi instanceof FieldInstanceField) {
+        this.walkExprForSpineRawSums((fi.f.fieldDef as {e?: Expr}).e);
+      }
+    }
+  }
+
   generateSQLJoinBlock(
     stageWriter: StageWriter,
     ji: JoinInstance,
@@ -1188,10 +1255,16 @@ export class QueryQuery extends QueryField {
           factJoin.dateField
         );
         const preaggCols = this.buildSpinePreAggCols(factDef, factJoin);
+        // Extra raw columns registered by scanForSpineRawColSums() for this join
+        const extraRawCols = this.spineExtraRawCols?.get(qs) ?? new Set<string>();
+        const extraPreaggCols = [...extraRawCols].map(
+          col => `SUM(${col}) AS __preagg_${col}`
+        );
         const selectCols = [
           `${truncExpr} AS spine_date`,
           ...factJoin.groupFields.map(gf => `${this.spineGroupDimSQL(gf, factStruct)} AS ${gf.alias}`),
           ...preaggCols,
+          ...extraPreaggCols,
           `COUNT(*) AS __preagg_count`,
           `1 AS __distinct_key`,
         ];
@@ -2441,6 +2514,10 @@ export class QueryQuery extends QueryField {
     this.rootResult.assignFieldsToGroups();
 
     this.rootResult.isComplexQuery ||= this.maxDepth > 0 || r.isComplex;
+    // Pre-scan for raw column .sum() calls on spine pre-agg joins so that
+    // generateSQLJoinBlock can include the necessary SUM(col) AS __preagg_col
+    // columns in the pre-aggregated subquery before any SQL is emitted.
+    this.scanForSpineRawColSums();
     if (this.rootResult.isComplexQuery) {
       return this.generateComplexSQL(stageWriter);
     } else {

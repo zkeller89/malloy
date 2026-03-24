@@ -298,6 +298,42 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
     );
   });
 
+  it('raw column .sum() on fact join: aggregates from fact table column', async () => {
+    // dep_flights.distance.sum() is a raw column sum — distance is not a named
+    // measure in the source, so it needs to be added to the pre-agg at query time.
+    // Jan: A has 2 events (distance 100 + 200 = 300); B has 1 event (distance 50).
+    // Feb: zero-fill → COALESCE produces 0.
+    await expect(`
+      ##! experimental { composite_sources parameters }
+      source: events_dist is duckdb.sql("""
+        SELECT * FROM (VALUES
+          ('A', TIMESTAMP '2020-01-10', 100),
+          ('A', TIMESTAMP '2020-01-20', 200),
+          ('B', TIMESTAMP '2020-01-15', 50)
+        ) t(category, event_date, distance)
+      """)
+      spine_composite: dist_spine(grain::string) {
+        spine_start: @2020-01-01
+        spine_end: @2020-02-28
+        spine_join: dep is events_dist {
+          spine_date: event_date
+          spine_group: category
+        }
+      }
+      run: dist_spine(grain is 'month') -> {
+        group_by: spine_date, category
+        aggregate: total_dist is dep.distance.sum()
+        order_by: spine_date, category
+      }
+    `).toMatchResult(
+      testModel,
+      {category: 'A', total_dist: 300},  // Jan: 100 + 200
+      {category: 'B', total_dist: 50},   // Jan: 50
+      {category: 'A', total_dist: 0},    // Feb: zero-fill
+      {category: 'B', total_dist: 0}     // Feb: zero-fill
+    );
+  });
+
   it('multiple spine_group: dims produce correct (date × carrier × region) grid', async () => {
     // Only 2 distinct (carrier, region) pairs exist: (A, east) and (B, west).
     // DISTINCT groups gives those 2 pairs (not a 2×2 cross product) × 2 months = 4 rows.

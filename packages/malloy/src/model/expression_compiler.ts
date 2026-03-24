@@ -903,6 +903,52 @@ export function generateSumFragment(
   expr: AggregateExpr,
   state: GenerateState
 ): string {
+  // Spine pre-agg joins: route all simple field sums through __preagg_<col>.
+  // Two IR shapes possible for `dep.distance.sum()`:
+  //   A) structPath: ['dep'],  e.path: ['distance']     (path within struct)
+  //   B) structPath: undefined, e.path: ['dep','distance'] (full path from root)
+  // Named measures redefined as SUM(__preagg_<name>) produce shape A with
+  // path[0]='__preagg_<name>' — those are let through to the existing code path.
+  // Spine pre-agg joins: route all simple field sums through __preagg_<col>.
+  // The column name is always the last element of e.path. The struct is resolved
+  // from expr.structPath when set, otherwise from e.path.slice(0,-1).
+  // Named measures already redefined as SUM(__preagg_<name>) have colName starting
+  // with '__preagg_' — those skip this intercept and use the normal code path.
+  if (expr.e?.node === 'field') {
+    const path = (expr.e as FieldnameNode).path;
+    if (path && path.length >= 1) {
+      const colName = path[path.length - 1];
+      if (!colName.startsWith('__preagg_')) {
+        const structPath =
+          expr.structPath && expr.structPath.length > 0
+            ? expr.structPath
+            : path.length >= 2
+              ? path.slice(0, -1)
+              : undefined;
+        let struct: QueryStruct | undefined;
+        if (structPath) {
+          try {
+            struct = context.getStructByName(structPath);
+          } catch {
+            struct = undefined;
+          }
+        }
+        if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+          const preaggCol = `__preagg_${colName}`;
+          const preaggRef = struct.dialect.sqlFieldReference(
+            struct.getIdentifier(),
+            'table',
+            preaggCol,
+            'number'
+          );
+          if (state.whereSQL) {
+            return `COALESCE(SUM(CASE WHEN ${state.whereSQL} THEN ${preaggRef} END), 0)`;
+          }
+          return `COALESCE(SUM(${preaggRef}), 0)`;
+        }
+      }
+    }
+  }
   const dimSQL = generateDimFragment(resultSet, context, expr.e, state);
   const distinctKeySQL = generateDistinctKeyIfNecessary(
     resultSet,
