@@ -348,6 +348,7 @@ export class DefineSpineComposite
         join: 'many' as const,
         matrixOperation: 'left' as const,
         onExpression: undefined,
+        primaryKey: undefined, // prevents source's pk being used for COUNT(DISTINCT pk); count() uses __distinct_key
         fields: redefinedFields,
       } as JoinFieldDef;
       spineJoinDef.fields.push(joinField as FieldDef);

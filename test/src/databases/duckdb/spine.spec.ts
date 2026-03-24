@@ -215,6 +215,40 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
     `).toMatchResult(testModel, {month_count: 3});
   });
 
+  it('count() on fact join: 1 for matched, 0 for zero-fill', async () => {
+    // count() on a spine fact join should yield 1 where rows matched (pre-agg
+    // __distinct_key=1) and 0 for zero-fill cells (LEFT JOIN NULL).
+    await expect(`
+      ##! experimental { composite_sources parameters }
+      source: events6 is duckdb.sql("""
+        SELECT * FROM (VALUES
+          ('A', TIMESTAMP '2020-01-10'),
+          ('A', TIMESTAMP '2020-01-20'),
+          ('B', TIMESTAMP '2020-01-15')
+        ) t(category, event_date)
+      """)
+      spine_composite: count_spine(grain::string) {
+        spine_start: @2020-01-01
+        spine_end: @2020-02-28
+        spine_join: events6 {
+          spine_date: event_date
+          spine_group: category
+        }
+      }
+      run: count_spine(grain is 'month') -> {
+        group_by: spine_date, category
+        aggregate: joined is events6.count()
+        order_by: spine_date, category
+      }
+    `).toMatchResult(
+      testModel,
+      {category: 'A', joined: 1},   // Jan: matched
+      {category: 'B', joined: 1},   // Jan: matched
+      {category: 'A', joined: 0},   // Feb: zero-fill
+      {category: 'B', joined: 0}    // Feb: zero-fill
+    );
+  });
+
   it('computed dimension in spine_group: resolves via expression compiler', async () => {
     // cat_upper is a computed dimension (upper(category)); spine_group must resolve
     // the expression, not use the computed-field name as a bare SQL column.
