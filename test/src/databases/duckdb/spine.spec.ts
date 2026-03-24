@@ -158,6 +158,8 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
     // When two spine_join entries reference the same fact table, aggregates must
     // NOT be inflated by a Cartesian product.  dep + arr each have 2 rows in Jan;
     // wrong fan-out would give 4 instead of 2 for each.
+    // Also verifies anonymous count() equals named count() — UNION ALL in the base
+    // grid would duplicate group rows and cause anonymous count() to double named count.
     await expect(`
       ##! experimental { composite_sources parameters }
       source: events3 is duckdb.sql("""
@@ -184,11 +186,13 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
         group_by: category
         aggregate:
           deps is dep_flights.evt_count,
-          arrs is arr_flights.evt_count
+          arrs is arr_flights.evt_count,
+          deps_anon is dep_flights.count(),
+          arrs_anon is arr_flights.count()
       }
     `).toMatchResult(
       testModel,
-      {category: 'A', deps: 2, arrs: 2}
+      {category: 'A', deps: 2, arrs: 2, deps_anon: 2, arrs_anon: 2}
     );
   });
 

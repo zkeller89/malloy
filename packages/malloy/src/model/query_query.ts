@@ -847,7 +847,7 @@ export class QueryQuery extends QueryField {
           baseSQL =
             `SELECT __spine.spine_date, __groups.*\n` +
             `FROM (${spineSQL}) AS __spine\n` +
-            `CROSS JOIN (\n${groupUnions.join('\nUNION ALL\n')}\n) AS __groups`;
+            `CROSS JOIN (\n${groupUnions.join('\nUNION\n')}\n) AS __groups`;
         } else {
           baseSQL = `SELECT spine_date FROM (${spineSQL}) AS __spine`;
         }
