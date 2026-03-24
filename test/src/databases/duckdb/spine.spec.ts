@@ -293,4 +293,42 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
       {cat_upper: 'B', row_count: 2}
     );
   });
+
+  it('multiple spine_group: dims produce correct (date × carrier × region) grid', async () => {
+    // Only 2 distinct (carrier, region) pairs exist: (A, east) and (B, west).
+    // DISTINCT groups gives those 2 pairs (not a 2×2 cross product) × 2 months = 4 rows.
+    // Jan: (A, east) has 1 event; (B, west) zero-fill.
+    // Feb: (B, west) has 1 event; (A, east) zero-fill.
+    await expect(`
+      ##! experimental { composite_sources parameters }
+      source: events7 is duckdb.sql("""
+        SELECT * FROM (VALUES
+          ('A', 'east', TIMESTAMP '2020-01-10'),
+          ('B', 'west', TIMESTAMP '2020-02-15')
+        ) t(carrier, region, event_date)
+      """) extend {
+        measure: evt_count is count()
+      }
+      spine_composite: multi_group_spine(grain::string) {
+        spine_start: @2020-01-01
+        spine_end: @2020-02-28
+        spine_join: events7 {
+          spine_date: event_date
+          spine_group: carrier
+          spine_group: region
+        }
+      }
+      run: multi_group_spine(grain is 'month') -> {
+        group_by: spine_date, carrier, region
+        aggregate: cnt is events7.evt_count
+        order_by: spine_date, carrier, region
+      }
+    `).toMatchResult(
+      testModel,
+      {carrier: 'A', region: 'east', cnt: 1},  // Jan: 1 event
+      {carrier: 'B', region: 'west', cnt: 0},  // Jan: zero-fill
+      {carrier: 'A', region: 'east', cnt: 0},  // Feb: zero-fill
+      {carrier: 'B', region: 'west', cnt: 1}   // Feb: 1 event
+    );
+  });
 });
