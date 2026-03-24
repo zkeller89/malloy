@@ -249,6 +249,16 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
     );
   });
 
+  it('invalid grain throws a clear error', async () => {
+    const query = testModel.model.loadQuery(`
+      ${spineComposite}
+      run: monthly_spine(grain is 'fortnight') -> {
+        aggregate: total_rows is count()
+      }
+    `);
+    await expect(query.run()).rejects.toThrow(/Invalid spine grain 'fortnight'/);
+  });
+
   it('computed dimension in spine_group: resolves via expression compiler', async () => {
     // cat_upper is a computed dimension (upper(category)); spine_group must resolve
     // the expression, not use the computed-field name as a bare SQL column.

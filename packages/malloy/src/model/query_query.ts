@@ -126,6 +126,26 @@ function pushDialectField(dl: DialectFieldList, f: DialectFieldArg) {
   }
 }
 
+const SPINE_VALID_GRAINS = new Set([
+  'second',
+  'minute',
+  'hour',
+  'day',
+  'week',
+  'month',
+  'quarter',
+  'year',
+]);
+
+function validateSpineGrain(grain: string): void {
+  if (!SPINE_VALID_GRAINS.has(grain)) {
+    throw new Error(
+      `Invalid spine grain '${grain}'. ` +
+        `Valid values are: ${[...SPINE_VALID_GRAINS].join(', ')}`
+    );
+  }
+}
+
 /** Query builder object. */
 export class QueryQuery extends QueryField {
   fieldDef: TurtleDef;
@@ -791,6 +811,7 @@ export class QueryQuery extends QueryField {
           (grainVal as StringLiteralNode).node === 'stringLiteral'
             ? (grainVal as StringLiteralNode).literal
             : 'day';
+        validateSpineGrain(grain);
 
         const spineSQL = this.parent.dialect.sqlDateSpineSQL(
           def.spineStart,
