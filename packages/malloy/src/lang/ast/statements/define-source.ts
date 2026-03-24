@@ -348,7 +348,14 @@ export class DefineSpineComposite
         join: 'many' as const,
         matrixOperation: 'left' as const,
         onExpression: undefined,
-        primaryKey: undefined, // prevents source's pk being used for COUNT(DISTINCT pk); count() uses __distinct_key
+        primaryKey: undefined,
+        // ^ Prevents the fact source's primary key from being used in COUNT(DISTINCT pk) —
+        // that column is absent from the pre-aggregated subquery. With no primary key set,
+        // generateDistinctKeySQL falls back to COUNT(DISTINCT __distinct_key).
+        // TODO(spine): anonymous count() on a spine fact join yields 0 or 1 (presence only),
+        // not the true row count. __distinct_key is a sentinel (always 1 when matched).
+        // Users must define a named measure (e.g. `evt_count is count()`) and reference it
+        // as `dep_flights.evt_count` to get actual per-cell counts.
         fields: redefinedFields,
       } as JoinFieldDef;
       spineJoinDef.fields.push(joinField as FieldDef);
