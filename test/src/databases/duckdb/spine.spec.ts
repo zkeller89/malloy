@@ -215,9 +215,9 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
     `).toMatchResult(testModel, {month_count: 3});
   });
 
-  it('count() on fact join: 1 for matched, 0 for zero-fill', async () => {
-    // count() on a spine fact join should yield 1 where rows matched (pre-agg
-    // __distinct_key=1) and 0 for zero-fill cells (LEFT JOIN NULL).
+  it('count() on fact join: returns actual row count per cell', async () => {
+    // count() on a spine fact join should return the true number of fact rows
+    // per (period, group) cell via COALESCE(SUM(__preagg_count), 0).
     await expect(`
       ##! experimental { composite_sources parameters }
       source: events6 is duckdb.sql("""
@@ -242,8 +242,8 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
       }
     `).toMatchResult(
       testModel,
-      {category: 'A', joined: 1},   // Jan: matched
-      {category: 'B', joined: 1},   // Jan: matched
+      {category: 'A', joined: 2},   // Jan: 2 events
+      {category: 'B', joined: 1},   // Jan: 1 event
       {category: 'A', joined: 0},   // Feb: zero-fill
       {category: 'B', joined: 0}    // Feb: zero-fill
     );

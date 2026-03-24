@@ -29,6 +29,7 @@ import type {
   AggregateExpr,
   SourceReferenceNode,
   CaseExpr,
+  JoinBase,
 } from './malloy_types';
 import type {
   FilterParserResponse,
@@ -974,13 +975,30 @@ export function generateCountFragment(
   expr: AggregateExpr,
   state: GenerateState
 ): string {
-  let func = 'COUNT(';
-  let thing = '1';
-
   let struct = context;
   if (expr.structPath) {
     struct = context.getStructByName(expr.structPath);
   }
+
+  // Spine fact joins pre-aggregate COUNT(*) AS __preagg_count per cell.
+  // Use COALESCE(SUM(__preagg_count), 0) for true row counts instead of
+  // COUNT(DISTINCT __distinct_key) which only yields 0 or 1.
+  if ((struct.structDef as JoinBase).isSpinePreAgg) {
+    const preaggRef = struct.dialect.sqlFieldReference(
+      struct.getIdentifier(),
+      'table',
+      '__preagg_count',
+      'number'
+    );
+    if (state.whereSQL) {
+      return `COALESCE(SUM(CASE WHEN ${state.whereSQL} THEN ${preaggRef} END), 0)`;
+    }
+    return `COALESCE(SUM(${preaggRef}), 0)`;
+  }
+
+  let func = 'COUNT(';
+  let thing = '1';
+
   const joinName = struct.getJoinableParent().getIdentifier();
   const join = resultSet.root().joins.get(joinName);
   if (!join) {

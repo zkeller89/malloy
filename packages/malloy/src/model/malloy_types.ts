@@ -1049,6 +1049,7 @@ export interface JoinBase {
   onExpression?: Expr;
   fieldUsage?: FieldUsage[];
   accessModifier?: NonDefaultAccessModifierLabel | undefined;
+  isSpinePreAgg?: boolean; // set on spine fact joins; count() → SUM(__preagg_count)
 }
 
 export type Joinable =

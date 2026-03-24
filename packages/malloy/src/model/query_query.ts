@@ -1179,13 +1179,10 @@ export class QueryQuery extends QueryField {
         //   group dimension columns
         //   __preagg_<measure> aggregate expressions
         //   1 AS __distinct_key  (so count() yields 0 or 1 per grid cell)
-        // TODO(spine): __distinct_key is a presence sentinel (always 1 when a fact row
-        // matched the cell). Anonymous count() on a spine fact join (e.g. dep_flights.count())
-        // resolves to COUNT(DISTINCT dep_flights_0.__distinct_key) = 0 or 1 only — not the
-        // true row count. Named count() measures work correctly because they pre-aggregate
-        // via COUNT(*) AS __preagg_<name> and the outer query uses COALESCE(SUM(...), 0).
-        // A future improvement could resolve anonymous count() to SUM(__preagg_<count_field>)
-        // automatically when such a named measure is available.
+        // __distinct_key is a presence sentinel (always 1 when a fact row matched).
+        // __preagg_count is COUNT(*) per pre-agg cell; anonymous count() on a spine fact
+        // join uses COALESCE(SUM(__preagg_count), 0) for true row counts (see
+        // generateCountFragment in expression_compiler.ts).
         const truncExpr = this.parent.dialect.sqlDateTruncToGrain(
           grain,
           factJoin.dateField
@@ -1195,6 +1192,7 @@ export class QueryQuery extends QueryField {
           `${truncExpr} AS spine_date`,
           ...factJoin.groupFields.map(gf => `${this.spineGroupDimSQL(gf, factStruct)} AS ${gf.alias}`),
           ...preaggCols,
+          `COUNT(*) AS __preagg_count`,
           `1 AS __distinct_key`,
         ];
         const groupCols = [

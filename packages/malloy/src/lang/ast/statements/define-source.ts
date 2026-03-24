@@ -318,7 +318,12 @@ export class DefineSpineComposite
       // Build the redefined field list for the join:
       //   - Dimensions: kept as-is
       //   - Aggregate measures: replaced with SUM(__preagg_<name>) pair
+      //   - __preagg_count: intrinsic COUNT(*) shadow column for anonymous count()
       const redefinedFields: FieldDef[] = [];
+      // Intrinsic shadow column for anonymous count() — maps to COUNT(*) AS __preagg_count
+      // in the pre-agg subquery. generateCountFragment detects isSpinePreAgg and emits
+      // COALESCE(SUM(__preagg_count), 0) instead of COUNT(DISTINCT __distinct_key).
+      redefinedFields.push({type: 'number', name: '__preagg_count'} as AtomicFieldDef);
       for (const f of factDef.fields) {
         if (!isAtomic(f)) continue;
         const af = f as AtomicFieldDef;
@@ -350,12 +355,10 @@ export class DefineSpineComposite
         onExpression: undefined,
         primaryKey: undefined,
         // ^ Prevents the fact source's primary key from being used in COUNT(DISTINCT pk) —
-        // that column is absent from the pre-aggregated subquery. With no primary key set,
-        // generateDistinctKeySQL falls back to COUNT(DISTINCT __distinct_key).
-        // TODO(spine): anonymous count() on a spine fact join yields 0 or 1 (presence only),
-        // not the true row count. __distinct_key is a sentinel (always 1 when matched).
-        // Users must define a named measure (e.g. `evt_count is count()`) and reference it
-        // as `dep_flights.evt_count` to get actual per-cell counts.
+        // that column is absent from the pre-aggregated subquery.
+        isSpinePreAgg: true,
+        // ^ Signals generateCountFragment to use COALESCE(SUM(__preagg_count), 0)
+        // for anonymous count() calls, returning true row counts instead of 0/1.
         fields: redefinedFields,
       } as JoinFieldDef;
       spineJoinDef.fields.push(joinField as FieldDef);
