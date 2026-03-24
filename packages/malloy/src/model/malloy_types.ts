@@ -1383,7 +1383,8 @@ export interface CompositeSourceDef extends SourceDefBase {
 
 export interface SpineGroupField {
   alias: string; // composite-level name (appears in queries, spine × groups UNION)
-  column: string; // physical column name in this specific fact source
+  column: string; // physical column name (fallback when fieldExpr is absent)
+  fieldExpr?: Expr; // set when column references a computed dimension
 }
 
 export interface SpineFactJoin {

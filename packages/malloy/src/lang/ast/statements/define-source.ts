@@ -250,11 +250,23 @@ export class DefineSpineComposite
     const seenGroupAliases = new Set<string>();
 
     for (const spec of this.joinSpecs) {
+      const factDef = doc.modelEntry(spec.sourceRef)?.entry as SourceDef | undefined;
+      const resolvedGroupFields: SpineGroupField[] = spec.groupFields.map(gf => {
+        if (factDef && isSourceDef(factDef)) {
+          const field = factDef.fields.find(
+            f => isAtomic(f) && ((f as AtomicFieldDef).as ?? f.name) === gf.column
+          ) as AtomicFieldDef | undefined;
+          if (field?.e) {
+            return {alias: gf.alias, column: gf.column, fieldExpr: field.e};
+          }
+        }
+        return {alias: gf.alias, column: gf.column};
+      });
       factJoins.push({
         sourceRef: spec.sourceRef,
         alias: spec.alias,
         dateField: spec.dateField,
-        groupFields: spec.groupFields,
+        groupFields: resolvedGroupFields,
       });
       for (const gf of spec.groupFields) {
         seenGroupAliases.add(gf.alias);
