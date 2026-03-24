@@ -389,7 +389,7 @@ function getParameterMap(
   );
 }
 
-function expandFunctionCall(
+export function expandFunctionCall(
   dialect: string,
   overload: FunctionOverloadDef,
   args: Expr[],

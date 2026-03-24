@@ -4,8 +4,9 @@
  */
 
 import type {DialectFieldList} from '../dialect';
-import {exprToSQL} from './expression_compiler';
+import {exprToSQL, expandFunctionCall} from './expression_compiler';
 import type {
+  Expr,
   TurtleDef,
   IndexFieldDef,
   IndexSegment,
@@ -32,7 +33,14 @@ import type {
   PrepareResultOptions,
   SpineJoinDef,
   SpineFactJoin,
+  SpineGroupField,
   StringLiteralNode,
+  NumberLiteralNode,
+  GenericSQLExpr,
+  FunctionCallNode,
+  BinaryExpr,
+  UnaryExpr,
+  FieldnameNode,
   SourceDef,
 } from './malloy_types';
 import {
@@ -811,7 +819,7 @@ export class QueryQuery extends QueryField {
               }
               const factSQL = this.getStructSourceSQL(factStruct, stageWriter);
               const cols = fj.groupFields
-                .map(gf => `${gf.column} AS ${gf.alias}`)
+                .map(gf => `${this.spineGroupDimSQL(gf, factStruct)} AS ${gf.alias}`)
                 .join(', ');
               return `SELECT DISTINCT ${cols} FROM ${factSQL}`;
             });
@@ -973,6 +981,100 @@ export class QueryQuery extends QueryField {
    * expression aliased as __preagg_<fieldName> (the shadow column consumed by
    * the redefined SUM measures in the SpineJoinDef JoinFieldDef).
    */
+  /**
+   * Returns the SQL expression for a spine group dimension in the context of the
+   * flat pre-agg subquery (single FROM, no joins). For physical columns, returns
+   * the bare column name. For computed dimensions, walks the Expr tree and emits
+   * unqualified SQL — column references become bare identifiers, not table.column.
+   */
+  spineGroupDimSQL(gf: SpineGroupField, factStruct: QueryStruct): string {
+    if (!gf.fieldExpr) return gf.column;
+    return this.flatDimExprToSQL(gf.fieldExpr, factStruct.dialect.name);
+  }
+
+  /**
+   * Walk an Expr tree and produce unqualified SQL for use inside a flat
+   * single-table subquery (no joins, so no table prefix needed).
+   */
+  private flatDimExprToSQL(expr: Expr, dialectName: string): string {
+    switch (expr.node) {
+      case 'field': {
+        const fn = expr as FieldnameNode;
+        // Use last path segment as the bare column name
+        return fn.path[fn.path.length - 1];
+      }
+      case 'genericSQLExpr': {
+        const gse = expr as GenericSQLExpr;
+        let result = '';
+        for (let i = 0; i < gse.src.length; i++) {
+          result += gse.src[i];
+          if (i < gse.kids.args.length) {
+            result += this.flatDimExprToSQL(gse.kids.args[i], dialectName);
+          }
+        }
+        return result;
+      }
+      case 'function_call': {
+        const fc = expr as FunctionCallNode;
+        const expanded = expandFunctionCall(dialectName, fc.overload, fc.kids.args, '', undefined);
+        return this.flatDimExprToSQL(expanded, dialectName);
+      }
+      case '+':
+      case '-':
+      case '*':
+      case '/':
+      case '%':
+      case 'and':
+      case 'or':
+      case '=':
+      case '!=':
+      case '>':
+      case '<':
+      case '>=':
+      case '<=':
+      case 'like':
+      case '!like': {
+        const b = expr as BinaryExpr;
+        const op = expr.node === '!like' ? 'NOT LIKE' : expr.node.toUpperCase();
+        return `(${this.flatDimExprToSQL(b.kids.left, dialectName)} ${op} ${this.flatDimExprToSQL(b.kids.right, dialectName)})`;
+      }
+      case '()': {
+        const u = expr as UnaryExpr;
+        return `(${this.flatDimExprToSQL(u.e, dialectName)})`;
+      }
+      case 'not': {
+        const u = expr as UnaryExpr;
+        return `NOT ${this.flatDimExprToSQL(u.e, dialectName)}`;
+      }
+      case 'unary-': {
+        const u = expr as UnaryExpr;
+        return `-${this.flatDimExprToSQL(u.e, dialectName)}`;
+      }
+      case 'is-null': {
+        const u = expr as UnaryExpr;
+        return `${this.flatDimExprToSQL(u.e, dialectName)} IS NULL`;
+      }
+      case 'is-not-null': {
+        const u = expr as UnaryExpr;
+        return `${this.flatDimExprToSQL(u.e, dialectName)} IS NOT NULL`;
+      }
+      case 'stringLiteral':
+        return `'${(expr as StringLiteralNode).literal}'`;
+      case 'numberLiteral':
+        return (expr as NumberLiteralNode).literal;
+      case 'true':
+        return 'TRUE';
+      case 'false':
+        return 'FALSE';
+      case 'null':
+        return 'NULL';
+      default:
+        throw new Error(
+          `spine_group: unsupported expression type '${expr.node}' in computed dimension. Use a simpler expression or a physical column name.`
+        );
+    }
+  }
+
   buildSpinePreAggCols(factDef: SourceDef, _factJoin: SpineFactJoin): string[] {
     const cols: string[] = [];
     for (const f of factDef.fields) {
@@ -1063,7 +1165,7 @@ export class QueryQuery extends QueryField {
         const preaggCols = this.buildSpinePreAggCols(factDef, factJoin);
         const selectCols = [
           `${truncExpr} AS spine_date`,
-          ...factJoin.groupFields.map(gf => `${gf.column} AS ${gf.alias}`),
+          ...factJoin.groupFields.map(gf => `${this.spineGroupDimSQL(gf, factStruct)} AS ${gf.alias}`),
           ...preaggCols,
           `1 AS __distinct_key`,
         ];

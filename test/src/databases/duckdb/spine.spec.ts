@@ -214,4 +214,39 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
       }
     `).toMatchResult(testModel, {month_count: 3});
   });
+
+  it('computed dimension in spine_group: resolves via expression compiler', async () => {
+    // cat_upper is a computed dimension (upper(category)); spine_group must resolve
+    // the expression, not use the computed-field name as a bare SQL column.
+    await expect(`
+      ##! experimental { composite_sources parameters }
+      source: events5 is duckdb.sql("""
+        SELECT * FROM (VALUES
+          ('a', TIMESTAMP '2020-01-10'),
+          ('b', TIMESTAMP '2020-01-20'),
+          ('a', TIMESTAMP '2020-02-05')
+        ) t(category, event_date)
+      """) extend {
+        dimension: cat_upper is upper(category)
+      }
+      spine_composite: computed_spine(grain::string) {
+        spine_start: @2020-01-01
+        spine_end: @2020-02-28
+        spine_join: events5 {
+          spine_date: event_date
+          spine_group: cat_upper
+        }
+      }
+      run: computed_spine(grain is 'month') -> {
+        group_by: cat_upper
+        aggregate: row_count is count()
+        order_by: cat_upper
+      }
+    `).toMatchResult(
+      testModel,
+      // both 'A' and 'B' (upper-cased) should appear in both months → 2 rows each
+      {cat_upper: 'A', row_count: 2},
+      {cat_upper: 'B', row_count: 2}
+    );
+  });
 });
