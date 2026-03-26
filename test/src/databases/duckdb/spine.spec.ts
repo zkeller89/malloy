@@ -371,4 +371,85 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
       {carrier: 'B', region: 'west', cnt: 1}   // Feb: 1 event
     );
   });
+
+  it('differing alias sets: per-alias CROSS JOIN strategy', async () => {
+    // dep_facts groups by [carrier, region]; arr_facts groups by [carrier] only.
+    // Only (A,east) and (B,west) co-occur in dep_facts, but the base grid is the full
+    // Cartesian product: {A,B} × {east,west} = 4 rows per date period.
+    // arr_facts joins only on (spine_date, carrier), so its counts are duplicated
+    // across all region values for a given carrier.
+    await expect(`
+      ##! experimental { composite_sources parameters }
+      source: dep_facts is duckdb.sql("""
+        SELECT * FROM (VALUES
+          ('A', 'east', TIMESTAMP '2020-01-10'),
+          ('B', 'west', TIMESTAMP '2020-01-15')
+        ) t(carrier, region, dep_date)
+      """) extend { measure: dep_count is count() }
+      source: arr_facts is duckdb.sql("""
+        SELECT * FROM (VALUES
+          ('A', TIMESTAMP '2020-01-11'),
+          ('B', TIMESTAMP '2020-01-16')
+        ) t(carrier, arr_date)
+      """) extend { measure: arr_count is count() }
+      spine_composite: mixed_alias_spine(grain::string) {
+        spine_start: @2020-01-01
+        spine_end: @2020-01-31
+        spine_join: dep is dep_facts {
+          spine_date: dep_date
+          spine_group: carrier
+          spine_group: region
+        }
+        spine_join: arr is arr_facts {
+          spine_date: arr_date
+          spine_group: carrier
+        }
+      }
+      run: mixed_alias_spine(grain is 'month') -> {
+        group_by: carrier, region
+        aggregate: deps is dep.dep_count, arrs is arr.arr_count
+        order_by: carrier, region
+      }
+    `).toMatchResult(
+      testModel,
+      {carrier: 'A', region: 'east', deps: 1, arrs: 1},
+      {carrier: 'A', region: 'west', deps: 0, arrs: 1},
+      {carrier: 'B', region: 'east', deps: 0, arrs: 1},
+      {carrier: 'B', region: 'west', deps: 1, arrs: 1}
+    );
+  });
+
+  it('differing alias sets: emits compile-time warning', async () => {
+    const source = `
+      ##! experimental { composite_sources parameters }
+      source: dep_facts is duckdb.sql("""
+        SELECT * FROM (VALUES ('A', 'east', TIMESTAMP '2020-01-10')) t(carrier, region, dep_date)
+      """)
+      source: arr_facts is duckdb.sql("""
+        SELECT * FROM (VALUES ('A', TIMESTAMP '2020-01-11')) t(carrier, arr_date)
+      """)
+      spine_composite: warn_spine(grain::string) {
+        spine_start: @2020-01-01
+        spine_end: @2020-01-31
+        spine_join: dep is dep_facts {
+          spine_date: dep_date
+          spine_group: carrier
+          spine_group: region
+        }
+        spine_join: arr is arr_facts {
+          spine_date: arr_date
+          spine_group: carrier
+        }
+      }
+    `;
+    const model = await runtime.getModel(source);
+    expect(model).toMatchObject({
+      problems: [
+        {
+          severity: 'warn',
+          message: expect.stringContaining('different spine_group alias sets'),
+        },
+      ],
+    });
+  });
 });
