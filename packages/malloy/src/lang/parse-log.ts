@@ -308,6 +308,7 @@ type MessageParameterTypes = {
   'spine-composite-bad-date-field': string;
   'spine-composite-bad-start': string;
   'spine-composite-bad-end': string;
+  'spine-composite-mismatched-group-aliases': string;
   'invalid-import-url': string;
   'no-translator-for-import': string;
   'name-conflict-on-selective-import': string;

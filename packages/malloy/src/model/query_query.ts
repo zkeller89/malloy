@@ -831,30 +831,69 @@ export class QueryQuery extends QueryField {
         }
         const allGroupAliases = [...seenAliases];
 
+        // Determine whether all non-empty fact joins share the same alias set
+        const joinsWithGroups = def.spineFactJoins.filter(
+          fj => fj.groupFields.length > 0
+        );
+        const allAliasesFingerprint = allGroupAliases.slice().sort().join(',');
+        const uniformAliasSet = joinsWithGroups.every(
+          fj =>
+            fj.groupFields
+              .map(gf => gf.alias)
+              .sort()
+              .join(',') === allAliasesFingerprint
+        );
+
         // Build spine × groups CROSS JOIN (grid only; fact joins are outer LEFT JOINs)
         let baseSQL: string;
-        if (allGroupAliases.length > 0) {
-          const groupUnions = def.spineFactJoins
-            .filter(fj => fj.groupFields.length > 0)
-            .map(fj => {
-              const factStruct = this.structRefToQueryStruct(fj.sourceRef);
-              if (!factStruct) {
-                throw new Error(
-                  `spine_composite: unknown source '${fj.sourceRef}'`
-                );
-              }
-              const factSQL = this.getStructSourceSQL(factStruct, stageWriter);
-              const cols = fj.groupFields
-                .map(gf => `${this.spineGroupDimSQL(gf, factStruct)} AS ${gf.alias}`)
-                .join(', ');
-              return `SELECT DISTINCT ${cols} FROM ${factSQL}`;
-            });
+        if (allGroupAliases.length === 0) {
+          // No group dims — bare date spine
+          baseSQL = `SELECT spine_date FROM (${spineSQL}) AS __spine`;
+        } else if (uniformAliasSet) {
+          // Strategy A: same alias set across all joins — UNION preserves co-occurring tuples
+          const groupUnions = joinsWithGroups.map(fj => {
+            const factStruct = this.structRefToQueryStruct(fj.sourceRef);
+            if (!factStruct) {
+              throw new Error(
+                `spine_composite: unknown source '${fj.sourceRef}'`
+              );
+            }
+            const factSQL = this.getStructSourceSQL(factStruct, stageWriter);
+            const cols = fj.groupFields
+              .map(gf => `${this.spineGroupDimSQL(gf, factStruct)} AS ${gf.alias}`)
+              .join(', ');
+            return `SELECT DISTINCT ${cols} FROM ${factSQL}`;
+          });
           baseSQL =
             `SELECT __spine.spine_date, __groups.*\n` +
             `FROM (${spineSQL}) AS __spine\n` +
             `CROSS JOIN (\n${groupUnions.join('\nUNION\n')}\n) AS __groups`;
         } else {
-          baseSQL = `SELECT spine_date FROM (${spineSQL}) AS __spine`;
+          // Strategy B: different alias sets — one per-alias SELECT DISTINCT + CROSS JOIN.
+          // Produces Cartesian product of distinct values for each alias independently.
+          // Fact joins that don't declare an alias join only on their own group fields,
+          // causing their values to be duplicated across all values of the missing alias.
+          const perAliasCrossJoins = allGroupAliases.map(alias => {
+            const subqueryParts = joinsWithGroups
+              .filter(fj => fj.groupFields.some(gf => gf.alias === alias))
+              .map(fj => {
+                const factStruct = this.structRefToQueryStruct(fj.sourceRef);
+                if (!factStruct) {
+                  throw new Error(
+                    `spine_composite: unknown source '${fj.sourceRef}'`
+                  );
+                }
+                const factSQL = this.getStructSourceSQL(factStruct, stageWriter);
+                const gf = fj.groupFields.find(g => g.alias === alias)!;
+                return `SELECT DISTINCT ${this.spineGroupDimSQL(gf, factStruct)} AS ${alias} FROM ${factSQL}`;
+              });
+            return `CROSS JOIN (\n${subqueryParts.join('\nUNION\n')}\n) AS __grp_${alias}`;
+          });
+          const selectCols = allGroupAliases.map(a => `__grp_${a}.${a}`).join(', ');
+          baseSQL =
+            `SELECT __spine.spine_date, ${selectCols}\n` +
+            `FROM (${spineSQL}) AS __spine\n` +
+            perAliasCrossJoins.join('\n');
         }
 
         return `(\n${baseSQL}\n)`;

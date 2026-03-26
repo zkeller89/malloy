@@ -273,6 +273,26 @@ export class DefineSpineComposite
       }
     }
 
+    // Warn when fact joins have different alias sets — SQL gen uses Cartesian product strategy
+    const joinsWithGroups = factJoins.filter(fj => fj.groupFields.length > 0);
+    if (joinsWithGroups.length > 1) {
+      const firstFingerprint = joinsWithGroups[0].groupFields
+        .map(gf => gf.alias)
+        .sort()
+        .join(',');
+      const hasNonUniform = joinsWithGroups.some(
+        fj => fj.groupFields.map(gf => gf.alias).sort().join(',') !== firstFingerprint
+      );
+      if (hasNonUniform) {
+        this.logWarning(
+          'spine-composite-mismatched-group-aliases',
+          `spine_composite '${this.name}': spine_join entries have different spine_group alias sets. ` +
+            `The base grid will be a Cartesian product of per-alias distinct values. ` +
+            `Fact joins that lack a group alias will have their values duplicated across all values of the missing dimension.`
+        );
+      }
+    }
+
     // 4. Build the composite field list:
     //    spine_date + one string dim per unique group alias + no measures yet
     //    (measures come from fact sources via composite resolution)
