@@ -166,6 +166,10 @@ export class QueryQuery extends QueryField {
   // Maps spine pre-agg join QueryStruct → raw column names that need SUM(col) AS __preagg_col
   // in the pre-agg subquery. Populated by scanForSpineRawColSums() before SQL generation.
   private spineExtraRawCols?: Map<QueryStruct, Set<string>>;
+  // Maps spine pre-agg join QueryStruct → raw column names that need SUM+COUNT injected
+  // for decomposed AVG: SUM(col) AS __preagg_sum_col, COUNT(col) AS __preagg_count_col.
+  // Populated by scanForSpineRawColAvgs() before SQL generation.
+  private spineExtraRawColAvgs?: Map<QueryStruct, Set<string>>;
 
   constructor(
     fieldDef: TurtleDef,
@@ -1242,6 +1246,69 @@ export class QueryQuery extends QueryField {
     }
   }
 
+  /**
+   * Walk an Expr tree looking for `avg(structPath.col)` calls on spine pre-agg
+   * joins where `col` is a raw (non-preagg) column. Registers found columns in
+   * `spineExtraRawColAvgs` so `generateSQLJoinBlock` can include the decomposed
+   * SUM(col) AS __preagg_sum_col and COUNT(col) AS __preagg_count_col columns.
+   */
+  private walkExprForSpineRawAvgs(expr: Expr | undefined): void {
+    if (!expr) return;
+    if (expr.node === 'aggregate' && (expr as AggregateExpr).function === 'avg') {
+      const agg = expr as AggregateExpr;
+      if (agg.e?.node === 'field') {
+        const path = (agg.e as FieldnameNode).path;
+        if (path && path.length >= 1) {
+          const col = path[path.length - 1];
+          if (!col.startsWith('__preagg_')) {
+            const structPath =
+              agg.structPath && agg.structPath.length > 0
+                ? agg.structPath
+                : path.length >= 2
+                  ? path.slice(0, -1)
+                  : undefined;
+            let struct: QueryStruct | undefined;
+            if (structPath) {
+              try { struct = this.parent.getStructByName(structPath); } catch { /* ignore */ }
+            }
+            if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+              if (!this.spineExtraRawColAvgs) this.spineExtraRawColAvgs = new Map();
+              let set = this.spineExtraRawColAvgs.get(struct);
+              if (!set) {
+                set = new Set();
+                this.spineExtraRawColAvgs.set(struct, set);
+              }
+              set.add(col);
+            }
+          }
+        }
+      }
+    }
+    // Recurse into standard child expression slots
+    const e = expr as unknown as Record<string, unknown>;
+    const inner = e['e'];
+    if (inner && typeof inner === 'object' && 'node' in (inner as object)) {
+      this.walkExprForSpineRawAvgs(inner as Expr);
+    }
+    const kids = e['kids'];
+    if (kids && typeof kids === 'object') {
+      for (const child of Object.values(kids as Record<string, unknown>)) {
+        if (child && typeof child === 'object' && 'node' in (child as object)) {
+          this.walkExprForSpineRawAvgs(child as Expr);
+        }
+      }
+    }
+  }
+
+  /** Pre-scan all result fields for raw column .avg() calls on spine pre-agg joins. */
+  private scanForSpineRawColAvgs(): void {
+    for (const [, fi] of this.rootResult.allFields) {
+      if (fi instanceof FieldInstanceField) {
+        this.walkExprForSpineRawAvgs((fi.f.fieldDef as {e?: Expr}).e);
+      }
+    }
+  }
+
   generateSQLJoinBlock(
     stageWriter: StageWriter,
     ji: JoinInstance,
@@ -1299,11 +1366,20 @@ export class QueryQuery extends QueryField {
         const extraPreaggCols = [...extraRawCols].map(
           col => `SUM(${col}) AS __preagg_${col}`
         );
+        // Extra raw columns registered by scanForSpineRawColAvgs() for this join.
+        // AVG is not decomposable (AVG(AVG(x)) ≠ AVG(x)), so we carry both
+        // SUM(col) and COUNT(col) per cell and divide in the outer query.
+        const extraAvgCols = this.spineExtraRawColAvgs?.get(qs) ?? new Set<string>();
+        const extraPreaggAvgCols = [...extraAvgCols].flatMap(col => [
+          `SUM(${col}) AS __preagg_sum_${col}`,
+          `COUNT(${col}) AS __preagg_count_${col}`,
+        ]);
         const selectCols = [
           `${truncExpr} AS spine_date`,
           ...factJoin.groupFields.map(gf => `${this.spineGroupDimSQL(gf, factStruct)} AS ${gf.alias}`),
           ...preaggCols,
           ...extraPreaggCols,
+          ...extraPreaggAvgCols,
           `COUNT(*) AS __preagg_count`,
           `1 AS __distinct_key`,
         ];
@@ -2553,10 +2629,11 @@ export class QueryQuery extends QueryField {
     this.rootResult.assignFieldsToGroups();
 
     this.rootResult.isComplexQuery ||= this.maxDepth > 0 || r.isComplex;
-    // Pre-scan for raw column .sum() calls on spine pre-agg joins so that
-    // generateSQLJoinBlock can include the necessary SUM(col) AS __preagg_col
-    // columns in the pre-aggregated subquery before any SQL is emitted.
+    // Pre-scan for raw column .sum() / .avg() calls on spine pre-agg joins so that
+    // generateSQLJoinBlock can include the necessary pre-agg columns before any
+    // SQL is emitted. .avg() needs SUM+COUNT (not AVG) for correct decomposition.
     this.scanForSpineRawColSums();
+    this.scanForSpineRawColAvgs();
     if (this.rootResult.isComplexQuery) {
       return this.generateComplexSQL(stageWriter);
     } else {

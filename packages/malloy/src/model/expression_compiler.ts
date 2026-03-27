@@ -986,6 +986,57 @@ export function generateAvgFragment(
   expr: AggregateExpr,
   state: GenerateState
 ): string {
+  // Spine pre-agg joins: AVG is not decomposable (AVG(AVG(x)) ≠ AVG(x)).
+  // Instead we carry SUM(col) and COUNT(col) per pre-agg cell and divide:
+  //   SUM(__preagg_sum_col) / NULLIF(SUM(__preagg_count_col), 0)
+  // The pre-agg subquery injects these columns via scanForSpineRawColAvgs().
+  // Named measures (already redefined as AVG(__preagg_<name>)) start with
+  // '__preagg_' and fall through to the normal code path below.
+  if (expr.e?.node === 'field') {
+    const path = (expr.e as FieldnameNode).path;
+    if (path && path.length >= 1) {
+      const colName = path[path.length - 1];
+      if (!colName.startsWith('__preagg_')) {
+        const structPath =
+          expr.structPath && expr.structPath.length > 0
+            ? expr.structPath
+            : path.length >= 2
+              ? path.slice(0, -1)
+              : undefined;
+        let struct: QueryStruct | undefined;
+        if (structPath) {
+          try {
+            struct = context.getStructByName(structPath);
+          } catch {
+            struct = undefined;
+          }
+        }
+        if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+          const sumCol = `__preagg_sum_${colName}`;
+          const countCol = `__preagg_count_${colName}`;
+          const sumRef = struct.dialect.sqlFieldReference(
+            struct.getIdentifier(),
+            'table',
+            sumCol,
+            'number'
+          );
+          const countRef = struct.dialect.sqlFieldReference(
+            struct.getIdentifier(),
+            'table',
+            countCol,
+            'number'
+          );
+          if (state.whereSQL) {
+            return (
+              `SUM(CASE WHEN ${state.whereSQL} THEN ${sumRef} END)` +
+              ` / NULLIF(SUM(CASE WHEN ${state.whereSQL} THEN ${countRef} END), 0)`
+            );
+          }
+          return `SUM(${sumRef}) / NULLIF(SUM(${countRef}), 0)`;
+        }
+      }
+    }
+  }
   const dimSQL = generateDimFragment(resultSet, context, expr.e, state);
   const distinctKeySQL = generateDistinctKeyIfNecessary(
     resultSet,
