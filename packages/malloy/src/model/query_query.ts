@@ -170,6 +170,10 @@ export class QueryQuery extends QueryField {
   // for decomposed AVG: SUM(col) AS __preagg_sum_col, COUNT(col) AS __preagg_count_col.
   // Populated by scanForSpineRawColAvgs() before SQL generation.
   private spineExtraRawColAvgs?: Map<QueryStruct, Set<string>>;
+  // Maps spine pre-agg join QueryStruct → raw column names that need MIN+MAX injected.
+  // Always injects both directions; overhead is negligible and users often want both.
+  // Populated by scanForSpineRawColMinMax() before SQL generation.
+  private spineExtraRawColMinMax?: Map<QueryStruct, Set<string>>;
 
   constructor(
     fieldDef: TurtleDef,
@@ -1167,7 +1171,12 @@ export class QueryQuery extends QueryField {
       if (e.node === 'aggregate') {
         if (e.function === 'count') {
           cols.push(`COUNT(*) AS ${preaggName}`);
-        } else if (e.function === 'sum' || e.function === 'avg') {
+        } else if (
+          e.function === 'sum' ||
+          e.function === 'avg' ||
+          e.function === 'min' ||
+          e.function === 'max'
+        ) {
           const innerE = e.e;
           if (
             innerE?.node === 'field' &&
@@ -1178,7 +1187,7 @@ export class QueryQuery extends QueryField {
             cols.push(`${fn}(${innerE.path[0]}) AS ${preaggName}`);
           }
         }
-        // max/min/distinct: skip — too complex for simple pre-agg SQL
+        // distinct: skip — COUNT DISTINCT is not decomposable across pre-agg cells
       }
     }
     return cols;
@@ -1309,6 +1318,73 @@ export class QueryQuery extends QueryField {
     }
   }
 
+  /**
+   * Walk an Expr tree looking for `min(structPath.col)` or `max(structPath.col)` calls
+   * on spine pre-agg joins where `col` is a raw (non-preagg) column. Registers found
+   * columns in `spineExtraRawColMinMax` so `generateSQLJoinBlock` can include
+   * MIN(col) AS __preagg_min_col and MAX(col) AS __preagg_max_col in the pre-agg SELECT.
+   */
+  private walkExprForSpineRawMinMax(expr: Expr | undefined): void {
+    if (!expr) return;
+    if (
+      expr.node === 'aggregate' &&
+      ((expr as AggregateExpr).function === 'min' ||
+        (expr as AggregateExpr).function === 'max')
+    ) {
+      const agg = expr as AggregateExpr;
+      if (agg.e?.node === 'field') {
+        const path = (agg.e as FieldnameNode).path;
+        if (path && path.length >= 1) {
+          const col = path[path.length - 1];
+          if (!col.startsWith('__preagg_')) {
+            const structPath =
+              agg.structPath && agg.structPath.length > 0
+                ? agg.structPath
+                : path.length >= 2
+                  ? path.slice(0, -1)
+                  : undefined;
+            let struct: QueryStruct | undefined;
+            if (structPath) {
+              try { struct = this.parent.getStructByName(structPath); } catch { /* ignore */ }
+            }
+            if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+              if (!this.spineExtraRawColMinMax) this.spineExtraRawColMinMax = new Map();
+              let set = this.spineExtraRawColMinMax.get(struct);
+              if (!set) {
+                set = new Set();
+                this.spineExtraRawColMinMax.set(struct, set);
+              }
+              set.add(col);
+            }
+          }
+        }
+      }
+    }
+    // Recurse into standard child expression slots
+    const e = expr as unknown as Record<string, unknown>;
+    const inner = e['e'];
+    if (inner && typeof inner === 'object' && 'node' in (inner as object)) {
+      this.walkExprForSpineRawMinMax(inner as Expr);
+    }
+    const kids = e['kids'];
+    if (kids && typeof kids === 'object') {
+      for (const child of Object.values(kids as Record<string, unknown>)) {
+        if (child && typeof child === 'object' && 'node' in (child as object)) {
+          this.walkExprForSpineRawMinMax(child as Expr);
+        }
+      }
+    }
+  }
+
+  /** Pre-scan all result fields for raw column .min()/.max() calls on spine pre-agg joins. */
+  private scanForSpineRawColMinMax(): void {
+    for (const [, fi] of this.rootResult.allFields) {
+      if (fi instanceof FieldInstanceField) {
+        this.walkExprForSpineRawMinMax((fi.f.fieldDef as {e?: Expr}).e);
+      }
+    }
+  }
+
   generateSQLJoinBlock(
     stageWriter: StageWriter,
     ji: JoinInstance,
@@ -1374,12 +1450,21 @@ export class QueryQuery extends QueryField {
           `SUM(${col}) AS __preagg_sum_${col}`,
           `COUNT(${col}) AS __preagg_count_${col}`,
         ]);
+        // Extra raw columns registered by scanForSpineRawColMinMax() for this join.
+        // MIN and MAX are decomposable: MIN(MIN(x))=MIN(x), MAX(MAX(x))=MAX(x).
+        // Both directions are always injected; overhead is negligible.
+        const extraMinMaxCols = this.spineExtraRawColMinMax?.get(qs) ?? new Set<string>();
+        const extraPreaggMinMaxCols = [...extraMinMaxCols].flatMap(col => [
+          `MIN(${col}) AS __preagg_min_${col}`,
+          `MAX(${col}) AS __preagg_max_${col}`,
+        ]);
         const selectCols = [
           `${truncExpr} AS spine_date`,
           ...factJoin.groupFields.map(gf => `${this.spineGroupDimSQL(gf, factStruct)} AS ${gf.alias}`),
           ...preaggCols,
           ...extraPreaggCols,
           ...extraPreaggAvgCols,
+          ...extraPreaggMinMaxCols,
           `COUNT(*) AS __preagg_count`,
           `1 AS __distinct_key`,
         ];
@@ -2629,11 +2714,12 @@ export class QueryQuery extends QueryField {
     this.rootResult.assignFieldsToGroups();
 
     this.rootResult.isComplexQuery ||= this.maxDepth > 0 || r.isComplex;
-    // Pre-scan for raw column .sum() / .avg() calls on spine pre-agg joins so that
+    // Pre-scan for raw column aggregate calls on spine pre-agg joins so that
     // generateSQLJoinBlock can include the necessary pre-agg columns before any
     // SQL is emitted. .avg() needs SUM+COUNT (not AVG) for correct decomposition.
     this.scanForSpineRawColSums();
     this.scanForSpineRawColAvgs();
+    this.scanForSpineRawColMinMax();
     if (this.rootResult.isComplexQuery) {
       return this.generateComplexSQL(stageWriter);
     } else {

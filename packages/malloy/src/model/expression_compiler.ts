@@ -974,6 +974,48 @@ export function generateSymmetricFragment(
   expr: AggregateExpr,
   state: GenerateState
 ): string {
+  // Spine pre-agg joins: route min/max through pre-agg'd columns.
+  // MIN(MIN(x)) = MIN(x) and MAX(MAX(x)) = MAX(x) — fully decomposable.
+  // Zero-fill cells (no fact rows) return NULL — correct for empty set.
+  if (
+    (expr.function === 'min' || expr.function === 'max') &&
+    expr.e?.node === 'field'
+  ) {
+    const path = (expr.e as FieldnameNode).path;
+    if (path && path.length >= 1) {
+      const colName = path[path.length - 1];
+      if (!colName.startsWith('__preagg_')) {
+        const structPath =
+          expr.structPath && expr.structPath.length > 0
+            ? expr.structPath
+            : path.length >= 2
+              ? path.slice(0, -1)
+              : undefined;
+        let struct: QueryStruct | undefined;
+        if (structPath) {
+          try {
+            struct = context.getStructByName(structPath);
+          } catch {
+            struct = undefined;
+          }
+        }
+        if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+          const fn = expr.function.toUpperCase();
+          const preaggCol = `__preagg_${expr.function}_${colName}`;
+          const preaggRef = struct.dialect.sqlFieldReference(
+            struct.getIdentifier(),
+            'table',
+            preaggCol,
+            'number'
+          );
+          if (state.whereSQL) {
+            return `${fn}(CASE WHEN ${state.whereSQL} THEN ${preaggRef} END)`;
+          }
+          return `${fn}(${preaggRef})`;
+        }
+      }
+    }
+  }
   const dimSQL = generateDimFragment(resultSet, context, expr.e, state);
   const f =
     expr.function === 'distinct' ? 'count(distinct ' : expr.function + '(';
