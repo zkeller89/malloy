@@ -27,6 +27,13 @@ import type {ParseTree, TerminalNode} from 'antlr4ts/tree';
 import {AbstractParseTreeVisitor} from 'antlr4ts/tree/AbstractParseTreeVisitor';
 import type {MalloyParserVisitor} from './lib/Malloy/MalloyParserVisitor';
 import type * as parse from './lib/Malloy/MalloyParser';
+import {
+  SpineCompositeStartContext,
+  SpineCompositeEndContext,
+  SpineCompositeFactJoinContext,
+  SpineJoinDateContext,
+  SpineJoinGroupContext,
+} from './lib/Malloy/MalloyParser';
 import * as ast from './ast';
 import type {
   LogMessageOptions,
@@ -390,6 +397,95 @@ export class MalloyToAST
     const defList = new ast.DefineSourceList(defs);
     defList.extendNote({blockNotes});
     return defList;
+  }
+
+  visitDefineSpineCompositeStatement(
+    pcx: parse.DefineSpineCompositeStatementContext
+  ): ast.DefineSpineComposite {
+    this.inExperiment('composite_sources', pcx);
+    const name = getId(pcx.sourceNameDef());
+    const params = this.getSourceParameters(pcx.sourceParameters());
+    const notes = this.getNotes(pcx.tags());
+
+    let startExpr: ast.ConstantExpression | undefined;
+    let endExpr: ast.ConstantExpression | undefined;
+    const joinSpecs: ast.SpineJoinSpec[] = [];
+
+    for (const itemCx of pcx.spineCompositeBody().spineCompositeItem()) {
+      if (itemCx instanceof SpineCompositeStartContext) {
+        startExpr = this.astAt(
+          new ast.ConstantExpression(this.getFieldExpr(itemCx.fieldExpr())),
+          itemCx
+        );
+      } else if (itemCx instanceof SpineCompositeEndContext) {
+        endExpr = this.astAt(
+          new ast.ConstantExpression(this.getFieldExpr(itemCx.fieldExpr())),
+          itemCx
+        );
+      } else if (itemCx instanceof SpineCompositeFactJoinContext) {
+        const ids = itemCx.id();
+        // spine_join: alias is source { ... }  → ids[0]=alias, ids[1]=sourceRef
+        // spine_join: source { ... }            → ids[0]=sourceRef, alias=sourceRef
+        const alias = idToStr(ids[0]);
+        const sourceRef = ids.length > 1 ? idToStr(ids[1]) : alias;
+        let dateField: string | undefined;
+        const groupFields: {alias: string; column: string}[] = [];
+        for (const joinItemCx of itemCx.spineJoinBody().spineJoinItem()) {
+          if (joinItemCx instanceof SpineJoinDateContext) {
+            dateField = getId(joinItemCx);
+          } else if (joinItemCx instanceof SpineJoinGroupContext) {
+            const ids = joinItemCx.id();
+            const alias = idToStr(ids[0]);
+            const column = ids.length > 1 ? idToStr(ids[1]) : alias;
+            groupFields.push({alias, column});
+          }
+        }
+        if (dateField === undefined) {
+          this.contextError(
+            itemCx,
+            'spine-composite-bad-date-field',
+            `spine_join '${sourceRef}' is missing spine_date:`
+          );
+        } else {
+          joinSpecs.push({alias, sourceRef, dateField, groupFields});
+        }
+      }
+    }
+
+    if (startExpr === undefined) {
+      this.contextError(
+        pcx,
+        'spine-composite-bad-start',
+        `spine_composite '${name}' is missing spine_start:`
+      );
+    }
+    if (endExpr === undefined) {
+      this.contextError(
+        pcx,
+        'spine-composite-bad-end',
+        `spine_composite '${name}' is missing spine_end:`
+      );
+    }
+
+    // If start/end are missing we still build the node so errors can propagate
+    const node = new ast.DefineSpineComposite(
+      name,
+      true,
+      startExpr ??
+        this.astAt(
+          new ast.ConstantExpression(new ast.ExprNow()),
+          pcx
+        ),
+      endExpr ??
+        this.astAt(
+          new ast.ConstantExpression(new ast.ExprNow()),
+          pcx
+        ),
+      joinSpecs,
+      params.length > 0 ? params : undefined
+    );
+    node.extendNote({notes});
+    return this.astAt(node, pcx);
   }
 
   getSourceParameter(

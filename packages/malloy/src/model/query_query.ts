@@ -4,8 +4,9 @@
  */
 
 import type {DialectFieldList} from '../dialect';
-import {exprToSQL} from './expression_compiler';
+import {exprToSQL, expandFunctionCall} from './expression_compiler';
 import type {
+  Expr,
   TurtleDef,
   IndexFieldDef,
   IndexSegment,
@@ -30,6 +31,19 @@ import type {
   UniqueKeyRequirement,
   Query,
   PrepareResultOptions,
+  SpineJoinDef,
+  SpineFactJoin,
+  SpineGroupField,
+  StringLiteralNode,
+  NumberLiteralNode,
+  GenericSQLExpr,
+  FunctionCallNode,
+  BinaryExpr,
+  UnaryExpr,
+  FieldnameNode,
+  SourceDef,
+  AggregateExpr,
+  JoinBase,
 } from './malloy_types';
 import {
   isRawSegment,
@@ -37,6 +51,7 @@ import {
   isQuerySegment,
   hasExpression,
   isAtomic,
+  expressionIsAggregate,
   expressionIsCalculation,
   expressionIsScalar,
   getIdentifier,
@@ -113,6 +128,26 @@ function pushDialectField(dl: DialectFieldList, f: DialectFieldArg) {
   }
 }
 
+const SPINE_VALID_GRAINS = new Set([
+  'second',
+  'minute',
+  'hour',
+  'day',
+  'week',
+  'month',
+  'quarter',
+  'year',
+]);
+
+function validateSpineGrain(grain: string): void {
+  if (!SPINE_VALID_GRAINS.has(grain)) {
+    throw new Error(
+      `Invalid spine grain '${grain}'. ` +
+        `Valid values are: ${[...SPINE_VALID_GRAINS].join(', ')}`
+    );
+  }
+}
+
 /** Query builder object. */
 export class QueryQuery extends QueryField {
   fieldDef: TurtleDef;
@@ -128,6 +163,17 @@ export class QueryQuery extends QueryField {
   // query_query doesn't have to include query_model because query_model
   // needs to include query_query. don't love this solution
   protected structRefToQueryStruct: (name: string) => QueryStruct | undefined;
+  // Maps spine pre-agg join QueryStruct → raw column names that need SUM(col) AS __preagg_col
+  // in the pre-agg subquery. Populated by scanForSpineRawColSums() before SQL generation.
+  private spineExtraRawCols?: Map<QueryStruct, Set<string>>;
+  // Maps spine pre-agg join QueryStruct → raw column names that need SUM+COUNT injected
+  // for decomposed AVG: SUM(col) AS __preagg_sum_col, COUNT(col) AS __preagg_count_col.
+  // Populated by scanForSpineRawColAvgs() before SQL generation.
+  private spineExtraRawColAvgs?: Map<QueryStruct, Set<string>>;
+  // Maps spine pre-agg join QueryStruct → raw column names that need MIN+MAX injected.
+  // Always injects both directions; overhead is negligible and users often want both.
+  // Populated by scanForSpineRawColMinMax() before SQL generation.
+  private spineExtraRawColMinMax?: Map<QueryStruct, Set<string>>;
 
   constructor(
     fieldDef: TurtleDef,
@@ -767,6 +813,99 @@ export class QueryQuery extends QueryField {
         // TODO: throw an error here; not simple because we call into this
         // code currently before the composite source is resolved in some cases
         return '{COMPOSITE SOURCE}';
+      case 'spine_join': {
+        const def = qs.structDef as SpineJoinDef;
+        // Extract grain from runtime arguments (defaults to 'day')
+        const grainArg = qs.arguments()['grain'];
+        const grainVal = grainArg?.value;
+        const grain =
+          grainVal &&
+          'node' in grainVal &&
+          (grainVal as StringLiteralNode).node === 'stringLiteral'
+            ? (grainVal as StringLiteralNode).literal
+            : 'day';
+        validateSpineGrain(grain);
+
+        const spineSQL = this.parent.dialect.sqlDateSpineSQL(
+          def.spineStart,
+          def.spineEnd,
+          grain
+        );
+
+        // Collect unique group aliases across all fact joins
+        const seenAliases = new Set<string>();
+        for (const fj of def.spineFactJoins) {
+          for (const gf of fj.groupFields) seenAliases.add(gf.alias);
+        }
+        const allGroupAliases = [...seenAliases];
+
+        // Determine whether all non-empty fact joins share the same alias set
+        const joinsWithGroups = def.spineFactJoins.filter(
+          fj => fj.groupFields.length > 0
+        );
+        const allAliasesFingerprint = allGroupAliases.slice().sort().join(',');
+        const uniformAliasSet = joinsWithGroups.every(
+          fj =>
+            fj.groupFields
+              .map(gf => gf.alias)
+              .sort()
+              .join(',') === allAliasesFingerprint
+        );
+
+        // Build spine × groups CROSS JOIN (grid only; fact joins are outer LEFT JOINs)
+        let baseSQL: string;
+        if (allGroupAliases.length === 0) {
+          // No group dims — bare date spine
+          baseSQL = `SELECT spine_date FROM (${spineSQL}) AS __spine`;
+        } else if (uniformAliasSet) {
+          // Strategy A: same alias set across all joins — UNION preserves co-occurring tuples
+          const groupUnions = joinsWithGroups.map(fj => {
+            const factStruct = this.structRefToQueryStruct(fj.sourceRef);
+            if (!factStruct) {
+              throw new Error(
+                `spine_composite: unknown source '${fj.sourceRef}'`
+              );
+            }
+            const factSQL = this.getStructSourceSQL(factStruct, stageWriter);
+            const cols = fj.groupFields
+              .map(gf => `${this.spineGroupDimSQL(gf, factStruct)} AS ${gf.alias}`)
+              .join(', ');
+            return `SELECT DISTINCT ${cols} FROM ${factSQL}`;
+          });
+          baseSQL =
+            `SELECT __spine.spine_date, __groups.*\n` +
+            `FROM (${spineSQL}) AS __spine\n` +
+            `CROSS JOIN (\n${groupUnions.join('\nUNION\n')}\n) AS __groups`;
+        } else {
+          // Strategy B: different alias sets — one per-alias SELECT DISTINCT + CROSS JOIN.
+          // Produces Cartesian product of distinct values for each alias independently.
+          // Fact joins that don't declare an alias join only on their own group fields,
+          // causing their values to be duplicated across all values of the missing alias.
+          const perAliasCrossJoins = allGroupAliases.map(alias => {
+            const subqueryParts = joinsWithGroups
+              .filter(fj => fj.groupFields.some(gf => gf.alias === alias))
+              .map(fj => {
+                const factStruct = this.structRefToQueryStruct(fj.sourceRef);
+                if (!factStruct) {
+                  throw new Error(
+                    `spine_composite: unknown source '${fj.sourceRef}'`
+                  );
+                }
+                const factSQL = this.getStructSourceSQL(factStruct, stageWriter);
+                const gf = fj.groupFields.find(g => g.alias === alias)!;
+                return `SELECT DISTINCT ${this.spineGroupDimSQL(gf, factStruct)} AS ${alias} FROM ${factSQL}`;
+              });
+            return `CROSS JOIN (\n${subqueryParts.join('\nUNION\n')}\n) AS __grp_${alias}`;
+          });
+          const selectCols = allGroupAliases.map(a => `__grp_${a}.${a}`).join(', ');
+          baseSQL =
+            `SELECT __spine.spine_date, ${selectCols}\n` +
+            `FROM (${spineSQL}) AS __spine\n` +
+            perAliasCrossJoins.join('\n');
+        }
+
+        return `(\n${baseSQL}\n)`;
+      }
       case 'finalize':
         return qs.structDef.name;
       case 'sql_select':
@@ -909,6 +1048,343 @@ export class QueryQuery extends QueryField {
     };
   }
 
+  /**
+   * Build pre-aggregated SELECT column expressions for a spine fact join.
+   * For each aggregate field in the fact source, generates a SQL aggregate
+   * expression aliased as __preagg_<fieldName> (the shadow column consumed by
+   * the redefined SUM measures in the SpineJoinDef JoinFieldDef).
+   */
+  /**
+   * Returns the SQL expression for a spine group dimension in the context of the
+   * flat pre-agg subquery (single FROM, no joins). For physical columns, returns
+   * the bare column name. For computed dimensions, walks the Expr tree and emits
+   * unqualified SQL — column references become bare identifiers, not table.column.
+   */
+  spineGroupDimSQL(gf: SpineGroupField, factStruct: QueryStruct): string {
+    if (!gf.fieldExpr) return gf.column;
+    return this.flatDimExprToSQL(gf.fieldExpr, factStruct.dialect.name);
+  }
+
+  /**
+   * Walk an Expr tree and produce unqualified SQL for use inside a flat
+   * single-table subquery (no joins, so no table prefix needed).
+   */
+  private flatDimExprToSQL(expr: Expr, dialectName: string): string {
+    switch (expr.node) {
+      case 'field': {
+        const fn = expr as FieldnameNode;
+        // Use last path segment as the bare column name
+        return fn.path[fn.path.length - 1];
+      }
+      case 'genericSQLExpr': {
+        const gse = expr as GenericSQLExpr;
+        let result = '';
+        for (let i = 0; i < gse.src.length; i++) {
+          result += gse.src[i];
+          if (i < gse.kids.args.length) {
+            result += this.flatDimExprToSQL(gse.kids.args[i], dialectName);
+          }
+        }
+        return result;
+      }
+      case 'function_call': {
+        const fc = expr as FunctionCallNode;
+        const expanded = expandFunctionCall(dialectName, fc.overload, fc.kids.args, '', undefined);
+        return this.flatDimExprToSQL(expanded, dialectName);
+      }
+      case '+':
+      case '-':
+      case '*':
+      case '/':
+      case '%':
+      case 'and':
+      case 'or':
+      case '=':
+      case '!=':
+      case '>':
+      case '<':
+      case '>=':
+      case '<=':
+      case 'like':
+      case '!like': {
+        const b = expr as BinaryExpr;
+        const op = expr.node === '!like' ? 'NOT LIKE' : expr.node.toUpperCase();
+        return `(${this.flatDimExprToSQL(b.kids.left, dialectName)} ${op} ${this.flatDimExprToSQL(b.kids.right, dialectName)})`;
+      }
+      case '()': {
+        const u = expr as UnaryExpr;
+        return `(${this.flatDimExprToSQL(u.e, dialectName)})`;
+      }
+      case 'not': {
+        const u = expr as UnaryExpr;
+        return `NOT ${this.flatDimExprToSQL(u.e, dialectName)}`;
+      }
+      case 'unary-': {
+        const u = expr as UnaryExpr;
+        return `-${this.flatDimExprToSQL(u.e, dialectName)}`;
+      }
+      case 'is-null': {
+        const u = expr as UnaryExpr;
+        return `${this.flatDimExprToSQL(u.e, dialectName)} IS NULL`;
+      }
+      case 'is-not-null': {
+        const u = expr as UnaryExpr;
+        return `${this.flatDimExprToSQL(u.e, dialectName)} IS NOT NULL`;
+      }
+      case 'stringLiteral':
+        return `'${(expr as StringLiteralNode).literal}'`;
+      case 'numberLiteral':
+        return (expr as NumberLiteralNode).literal;
+      case 'true':
+        return 'TRUE';
+      case 'false':
+        return 'FALSE';
+      case 'null':
+        return 'NULL';
+      default:
+        throw new Error(
+          `spine_group: unsupported expression type '${expr.node}' in computed dimension. Use a simpler expression or a physical column name.`
+        );
+    }
+  }
+
+  buildSpinePreAggCols(factDef: SourceDef, _factJoin: SpineFactJoin): string[] {
+    const cols: string[] = [];
+    for (const f of factDef.fields) {
+      if (!isAtomic(f)) continue;
+      // AtomicFieldDef has Expression fields (e, expressionType) from FieldBase
+      const af = f as FieldDef & {
+        name: string;
+        as?: string;
+        expressionType?: import('./malloy_types').ExpressionType;
+        e?: {
+          node: string;
+          function?: string;
+          e?: {node: string; path?: string[]};
+        };
+      };
+      if (!expressionIsAggregate(af.expressionType)) continue;
+      const colName = af.as ?? af.name;
+      const preaggName = `__preagg_${colName}`;
+      const e = af.e;
+      if (!e) continue;
+      if (e.node === 'aggregate') {
+        if (e.function === 'count') {
+          cols.push(`COUNT(*) AS ${preaggName}`);
+        } else if (
+          e.function === 'sum' ||
+          e.function === 'avg' ||
+          e.function === 'min' ||
+          e.function === 'max'
+        ) {
+          const innerE = e.e;
+          if (
+            innerE?.node === 'field' &&
+            Array.isArray(innerE.path) &&
+            innerE.path.length === 1
+          ) {
+            const fn = e.function.toUpperCase();
+            cols.push(`${fn}(${innerE.path[0]}) AS ${preaggName}`);
+          }
+        }
+        // distinct: skip — COUNT DISTINCT is not decomposable across pre-agg cells
+      }
+    }
+    return cols;
+  }
+
+  /**
+   * Walk an Expr tree looking for `sum(structPath.col)` calls on spine pre-agg
+   * joins where `col` is a raw (non-preagg) column. Registers found columns in
+   * `spineExtraRawCols` so `generateSQLJoinBlock` can include them in the pre-agg SELECT.
+   */
+  private walkExprForSpineRawSums(expr: Expr | undefined): void {
+    if (!expr) return;
+    if (expr.node === 'aggregate' && (expr as AggregateExpr).function === 'sum') {
+      const agg = expr as AggregateExpr;
+      if (agg.e?.node === 'field') {
+        const path = (agg.e as FieldnameNode).path;
+        if (path && path.length >= 1) {
+          const col = path[path.length - 1];
+          if (!col.startsWith('__preagg_')) {
+            const structPath =
+              agg.structPath && agg.structPath.length > 0
+                ? agg.structPath
+                : path.length >= 2
+                  ? path.slice(0, -1)
+                  : undefined;
+            let struct: QueryStruct | undefined;
+            if (structPath) {
+              try { struct = this.parent.getStructByName(structPath); } catch { /* ignore */ }
+            }
+            if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+              if (!this.spineExtraRawCols) this.spineExtraRawCols = new Map();
+              let set = this.spineExtraRawCols.get(struct);
+              if (!set) {
+                set = new Set();
+                this.spineExtraRawCols.set(struct, set);
+              }
+              set.add(col);
+            }
+          }
+        }
+      }
+    }
+    // Recurse into standard child expression slots
+    const e = expr as unknown as Record<string, unknown>;
+    const inner = e['e'];
+    if (inner && typeof inner === 'object' && 'node' in (inner as object)) {
+      this.walkExprForSpineRawSums(inner as Expr);
+    }
+    const kids = e['kids'];
+    if (kids && typeof kids === 'object') {
+      for (const child of Object.values(kids as Record<string, unknown>)) {
+        if (child && typeof child === 'object' && 'node' in (child as object)) {
+          this.walkExprForSpineRawSums(child as Expr);
+        }
+      }
+    }
+  }
+
+  /** Pre-scan all result fields for raw column .sum() calls on spine pre-agg joins. */
+  private scanForSpineRawColSums(): void {
+    for (const [, fi] of this.rootResult.allFields) {
+      if (fi instanceof FieldInstanceField) {
+        this.walkExprForSpineRawSums((fi.f.fieldDef as {e?: Expr}).e);
+      }
+    }
+  }
+
+  /**
+   * Walk an Expr tree looking for `avg(structPath.col)` calls on spine pre-agg
+   * joins where `col` is a raw (non-preagg) column. Registers found columns in
+   * `spineExtraRawColAvgs` so `generateSQLJoinBlock` can include the decomposed
+   * SUM(col) AS __preagg_sum_col and COUNT(col) AS __preagg_count_col columns.
+   */
+  private walkExprForSpineRawAvgs(expr: Expr | undefined): void {
+    if (!expr) return;
+    if (expr.node === 'aggregate' && (expr as AggregateExpr).function === 'avg') {
+      const agg = expr as AggregateExpr;
+      if (agg.e?.node === 'field') {
+        const path = (agg.e as FieldnameNode).path;
+        if (path && path.length >= 1) {
+          const col = path[path.length - 1];
+          if (!col.startsWith('__preagg_')) {
+            const structPath =
+              agg.structPath && agg.structPath.length > 0
+                ? agg.structPath
+                : path.length >= 2
+                  ? path.slice(0, -1)
+                  : undefined;
+            let struct: QueryStruct | undefined;
+            if (structPath) {
+              try { struct = this.parent.getStructByName(structPath); } catch { /* ignore */ }
+            }
+            if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+              if (!this.spineExtraRawColAvgs) this.spineExtraRawColAvgs = new Map();
+              let set = this.spineExtraRawColAvgs.get(struct);
+              if (!set) {
+                set = new Set();
+                this.spineExtraRawColAvgs.set(struct, set);
+              }
+              set.add(col);
+            }
+          }
+        }
+      }
+    }
+    // Recurse into standard child expression slots
+    const e = expr as unknown as Record<string, unknown>;
+    const inner = e['e'];
+    if (inner && typeof inner === 'object' && 'node' in (inner as object)) {
+      this.walkExprForSpineRawAvgs(inner as Expr);
+    }
+    const kids = e['kids'];
+    if (kids && typeof kids === 'object') {
+      for (const child of Object.values(kids as Record<string, unknown>)) {
+        if (child && typeof child === 'object' && 'node' in (child as object)) {
+          this.walkExprForSpineRawAvgs(child as Expr);
+        }
+      }
+    }
+  }
+
+  /** Pre-scan all result fields for raw column .avg() calls on spine pre-agg joins. */
+  private scanForSpineRawColAvgs(): void {
+    for (const [, fi] of this.rootResult.allFields) {
+      if (fi instanceof FieldInstanceField) {
+        this.walkExprForSpineRawAvgs((fi.f.fieldDef as {e?: Expr}).e);
+      }
+    }
+  }
+
+  /**
+   * Walk an Expr tree looking for `min(structPath.col)` or `max(structPath.col)` calls
+   * on spine pre-agg joins where `col` is a raw (non-preagg) column. Registers found
+   * columns in `spineExtraRawColMinMax` so `generateSQLJoinBlock` can include
+   * MIN(col) AS __preagg_min_col and MAX(col) AS __preagg_max_col in the pre-agg SELECT.
+   */
+  private walkExprForSpineRawMinMax(expr: Expr | undefined): void {
+    if (!expr) return;
+    if (
+      expr.node === 'aggregate' &&
+      ((expr as AggregateExpr).function === 'min' ||
+        (expr as AggregateExpr).function === 'max')
+    ) {
+      const agg = expr as AggregateExpr;
+      if (agg.e?.node === 'field') {
+        const path = (agg.e as FieldnameNode).path;
+        if (path && path.length >= 1) {
+          const col = path[path.length - 1];
+          if (!col.startsWith('__preagg_')) {
+            const structPath =
+              agg.structPath && agg.structPath.length > 0
+                ? agg.structPath
+                : path.length >= 2
+                  ? path.slice(0, -1)
+                  : undefined;
+            let struct: QueryStruct | undefined;
+            if (structPath) {
+              try { struct = this.parent.getStructByName(structPath); } catch { /* ignore */ }
+            }
+            if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+              if (!this.spineExtraRawColMinMax) this.spineExtraRawColMinMax = new Map();
+              let set = this.spineExtraRawColMinMax.get(struct);
+              if (!set) {
+                set = new Set();
+                this.spineExtraRawColMinMax.set(struct, set);
+              }
+              set.add(col);
+            }
+          }
+        }
+      }
+    }
+    // Recurse into standard child expression slots
+    const e = expr as unknown as Record<string, unknown>;
+    const inner = e['e'];
+    if (inner && typeof inner === 'object' && 'node' in (inner as object)) {
+      this.walkExprForSpineRawMinMax(inner as Expr);
+    }
+    const kids = e['kids'];
+    if (kids && typeof kids === 'object') {
+      for (const child of Object.values(kids as Record<string, unknown>)) {
+        if (child && typeof child === 'object' && 'node' in (child as object)) {
+          this.walkExprForSpineRawMinMax(child as Expr);
+        }
+      }
+    }
+  }
+
+  /** Pre-scan all result fields for raw column .min()/.max() calls on spine pre-agg joins. */
+  private scanForSpineRawColMinMax(): void {
+    for (const [, fi] of this.rootResult.allFields) {
+      if (fi instanceof FieldInstanceField) {
+        this.walkExprForSpineRawMinMax((fi.f.fieldDef as {e?: Expr}).e);
+      }
+    }
+  }
+
   generateSQLJoinBlock(
     stageWriter: StageWriter,
     ji: JoinInstance,
@@ -917,6 +1393,104 @@ export class QueryQuery extends QueryField {
     let s = '';
     const qs = ji.queryStruct;
     const qsDef = qs.structDef;
+
+    // Intercept spine fact joins: generate a pre-aggregated subquery LEFT JOIN
+    // instead of the raw table join, avoiding fan-out when multiple fact joins are used.
+    const parentStructDef = qs.parent?.structDef;
+    if (parentStructDef?.type === 'spine_join') {
+      const spineDef = parentStructDef as SpineJoinDef;
+      const factJoin = spineDef.spineFactJoins.find(
+        fj => fj.alias === getIdentifier(qsDef)
+      );
+      if (factJoin) {
+        // Extract grain (same grain parameter as the composite source)
+        const grainArg = qs.parent!.arguments()['grain'];
+        const grainVal = grainArg?.value;
+        const grain =
+          grainVal &&
+          'node' in grainVal &&
+          (grainVal as StringLiteralNode).node === 'stringLiteral'
+            ? (grainVal as StringLiteralNode).literal
+            : 'day';
+
+        // Original fact source SQL (unwrapped table / SQL select)
+        const factStruct = this.structRefToQueryStruct(factJoin.sourceRef);
+        if (!factStruct) {
+          throw new Error(
+            `spine_composite: unknown source '${factJoin.sourceRef}'`
+          );
+        }
+        const rawFactSQL = this.getStructSourceSQL(factStruct, stageWriter);
+        const factDef = factStruct.structDef as SourceDef;
+
+        // Build pre-aggregated SELECT:
+        //   DATE_TRUNC(grain, dateField) AS spine_date
+        //   group dimension columns
+        //   __preagg_<measure> aggregate expressions
+        //   1 AS __distinct_key  (so count() yields 0 or 1 per grid cell)
+        // __distinct_key is a presence sentinel (always 1 when a fact row matched).
+        // __preagg_count is COUNT(*) per pre-agg cell; anonymous count() on a spine fact
+        // join uses COALESCE(SUM(__preagg_count), 0) for true row counts (see
+        // generateCountFragment in expression_compiler.ts).
+        const truncExpr = this.parent.dialect.sqlDateTruncToGrain(
+          grain,
+          factJoin.dateField
+        );
+        const preaggCols = this.buildSpinePreAggCols(factDef, factJoin);
+        // Extra raw columns registered by scanForSpineRawColSums() for this join
+        const extraRawCols = this.spineExtraRawCols?.get(qs) ?? new Set<string>();
+        const extraPreaggCols = [...extraRawCols].map(
+          col => `SUM(${col}) AS __preagg_${col}`
+        );
+        // Extra raw columns registered by scanForSpineRawColAvgs() for this join.
+        // AVG is not decomposable (AVG(AVG(x)) ≠ AVG(x)), so we carry both
+        // SUM(col) and COUNT(col) per cell and divide in the outer query.
+        const extraAvgCols = this.spineExtraRawColAvgs?.get(qs) ?? new Set<string>();
+        const extraPreaggAvgCols = [...extraAvgCols].flatMap(col => [
+          `SUM(${col}) AS __preagg_sum_${col}`,
+          `COUNT(${col}) AS __preagg_count_${col}`,
+        ]);
+        // Extra raw columns registered by scanForSpineRawColMinMax() for this join.
+        // MIN and MAX are decomposable: MIN(MIN(x))=MIN(x), MAX(MAX(x))=MAX(x).
+        // Both directions are always injected; overhead is negligible.
+        const extraMinMaxCols = this.spineExtraRawColMinMax?.get(qs) ?? new Set<string>();
+        const extraPreaggMinMaxCols = [...extraMinMaxCols].flatMap(col => [
+          `MIN(${col}) AS __preagg_min_${col}`,
+          `MAX(${col}) AS __preagg_max_${col}`,
+        ]);
+        const selectCols = [
+          `${truncExpr} AS spine_date`,
+          ...factJoin.groupFields.map(gf => `${this.spineGroupDimSQL(gf, factStruct)} AS ${gf.alias}`),
+          ...preaggCols,
+          ...extraPreaggCols,
+          ...extraPreaggAvgCols,
+          ...extraPreaggMinMaxCols,
+          `COUNT(*) AS __preagg_count`,
+          `1 AS __distinct_key`,
+        ];
+        const groupCols = [
+          'spine_date',
+          ...factJoin.groupFields.map(gf => gf.alias),
+        ];
+        const preAggSQL =
+          `(SELECT ${selectCols.join(', ')}\n` +
+          `FROM ${rawFactSQL}\n` +
+          `GROUP BY ${groupCols.join(', ')})`;
+
+        // Parent alias is the spine base grid's SQL alias
+        const parentAlias = ji.parent?.alias ?? '';
+        const dateCond = `${ji.alias}.spine_date = ${parentAlias}.spine_date`;
+        const groupConds = factJoin.groupFields
+          .map(gf => `${ji.alias}.${gf.alias} = ${parentAlias}.${gf.alias}`)
+          .join(' AND ');
+        const onCond = [dateCond, groupConds].filter(Boolean).join(' AND ');
+
+        qs.eventStream?.emit('join-used', {name: getIdentifier(qsDef)});
+        qs.maybeEmitParameterizedSourceUsage();
+        return ` LEFT JOIN ${preAggSQL} AS ${ji.alias}\n  ON ${onCond}\n`;
+      }
+    }
+
     qs.eventStream?.emit('join-used', {name: getIdentifier(qsDef)});
     qs.maybeEmitParameterizedSourceUsage();
     if (isJoinedSource(qsDef)) {
@@ -2140,6 +2714,12 @@ export class QueryQuery extends QueryField {
     this.rootResult.assignFieldsToGroups();
 
     this.rootResult.isComplexQuery ||= this.maxDepth > 0 || r.isComplex;
+    // Pre-scan for raw column aggregate calls on spine pre-agg joins so that
+    // generateSQLJoinBlock can include the necessary pre-agg columns before any
+    // SQL is emitted. .avg() needs SUM+COUNT (not AVG) for correct decomposition.
+    this.scanForSpineRawColSums();
+    this.scanForSpineRawColAvgs();
+    this.scanForSpineRawColMinMax();
     if (this.rootResult.isComplexQuery) {
       return this.generateComplexSQL(stageWriter);
     } else {

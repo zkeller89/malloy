@@ -416,6 +416,14 @@ ${indent(sql)}
     return 'CURRENT_TIMESTAMP()';
   }
 
+  sqlDateSpineSQL(_start: string, _end: string, _grain: string): string {
+    throw new Error('spine_composite is not yet supported on Snowflake');
+  }
+
+  sqlDateTruncToGrain(_grain: string, _expr: string): string {
+    throw new Error('spine_composite is not yet supported on Snowflake');
+  }
+
   sqlCast(qi: QueryInfo, cast: TypecastExpr): string {
     const src = cast.e.sql || '';
     const {srcTypeDef, dstTypeDef, dstSQLType} = this.sqlCastPrep(cast);

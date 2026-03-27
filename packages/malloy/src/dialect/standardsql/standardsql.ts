@@ -317,6 +317,19 @@ ${indent(sql)}
     return 'CURRENT_TIMESTAMP()';
   }
 
+  sqlDateSpineSQL(start: string, end: string, grain: string): string {
+    // BigQuery: GENERATE_DATE_ARRAY for day-grain; use UNNEST of date range
+    return (
+      `SELECT spine_date FROM UNNEST(` +
+      `GENERATE_DATE_ARRAY(DATE(${start}), DATE(${end}), INTERVAL 1 ${grain.toUpperCase()})` +
+      `) AS spine_date`
+    );
+  }
+
+  sqlDateTruncToGrain(grain: string, expr: string): string {
+    return `DATE_TRUNC(${expr}, ${grain.toUpperCase()})`;
+  }
+
   sqlTimeExtractExpr(qi: QueryInfo, te: TimeExtractExpr): string {
     const extractTo = extractMap[te.units] || te.units;
     const tz = TD.isAnyTimestamp(te.e.typeDef) && qtz(qi);

@@ -29,6 +29,7 @@ import type {
   AggregateExpr,
   SourceReferenceNode,
   CaseExpr,
+  JoinBase,
 } from './malloy_types';
 import type {
   FilterParserResponse,
@@ -389,7 +390,7 @@ function getParameterMap(
   );
 }
 
-function expandFunctionCall(
+export function expandFunctionCall(
   dialect: string,
   overload: FunctionOverloadDef,
   args: Expr[],
@@ -902,6 +903,52 @@ export function generateSumFragment(
   expr: AggregateExpr,
   state: GenerateState
 ): string {
+  // Spine pre-agg joins: route all simple field sums through __preagg_<col>.
+  // Two IR shapes possible for `dep.distance.sum()`:
+  //   A) structPath: ['dep'],  e.path: ['distance']     (path within struct)
+  //   B) structPath: undefined, e.path: ['dep','distance'] (full path from root)
+  // Named measures redefined as SUM(__preagg_<name>) produce shape A with
+  // path[0]='__preagg_<name>' — those are let through to the existing code path.
+  // Spine pre-agg joins: route all simple field sums through __preagg_<col>.
+  // The column name is always the last element of e.path. The struct is resolved
+  // from expr.structPath when set, otherwise from e.path.slice(0,-1).
+  // Named measures already redefined as SUM(__preagg_<name>) have colName starting
+  // with '__preagg_' — those skip this intercept and use the normal code path.
+  if (expr.e?.node === 'field') {
+    const path = (expr.e as FieldnameNode).path;
+    if (path && path.length >= 1) {
+      const colName = path[path.length - 1];
+      if (!colName.startsWith('__preagg_')) {
+        const structPath =
+          expr.structPath && expr.structPath.length > 0
+            ? expr.structPath
+            : path.length >= 2
+              ? path.slice(0, -1)
+              : undefined;
+        let struct: QueryStruct | undefined;
+        if (structPath) {
+          try {
+            struct = context.getStructByName(structPath);
+          } catch {
+            struct = undefined;
+          }
+        }
+        if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+          const preaggCol = `__preagg_${colName}`;
+          const preaggRef = struct.dialect.sqlFieldReference(
+            struct.getIdentifier(),
+            'table',
+            preaggCol,
+            'number'
+          );
+          if (state.whereSQL) {
+            return `COALESCE(SUM(CASE WHEN ${state.whereSQL} THEN ${preaggRef} END), 0)`;
+          }
+          return `COALESCE(SUM(${preaggRef}), 0)`;
+        }
+      }
+    }
+  }
   const dimSQL = generateDimFragment(resultSet, context, expr.e, state);
   const distinctKeySQL = generateDistinctKeyIfNecessary(
     resultSet,
@@ -927,6 +974,48 @@ export function generateSymmetricFragment(
   expr: AggregateExpr,
   state: GenerateState
 ): string {
+  // Spine pre-agg joins: route min/max through pre-agg'd columns.
+  // MIN(MIN(x)) = MIN(x) and MAX(MAX(x)) = MAX(x) — fully decomposable.
+  // Zero-fill cells (no fact rows) return NULL — correct for empty set.
+  if (
+    (expr.function === 'min' || expr.function === 'max') &&
+    expr.e?.node === 'field'
+  ) {
+    const path = (expr.e as FieldnameNode).path;
+    if (path && path.length >= 1) {
+      const colName = path[path.length - 1];
+      if (!colName.startsWith('__preagg_')) {
+        const structPath =
+          expr.structPath && expr.structPath.length > 0
+            ? expr.structPath
+            : path.length >= 2
+              ? path.slice(0, -1)
+              : undefined;
+        let struct: QueryStruct | undefined;
+        if (structPath) {
+          try {
+            struct = context.getStructByName(structPath);
+          } catch {
+            struct = undefined;
+          }
+        }
+        if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+          const fn = expr.function.toUpperCase();
+          const preaggCol = `__preagg_${expr.function}_${colName}`;
+          const preaggRef = struct.dialect.sqlFieldReference(
+            struct.getIdentifier(),
+            'table',
+            preaggCol,
+            'number'
+          );
+          if (state.whereSQL) {
+            return `${fn}(CASE WHEN ${state.whereSQL} THEN ${preaggRef} END)`;
+          }
+          return `${fn}(${preaggRef})`;
+        }
+      }
+    }
+  }
   const dimSQL = generateDimFragment(resultSet, context, expr.e, state);
   const f =
     expr.function === 'distinct' ? 'count(distinct ' : expr.function + '(';
@@ -939,6 +1028,57 @@ export function generateAvgFragment(
   expr: AggregateExpr,
   state: GenerateState
 ): string {
+  // Spine pre-agg joins: AVG is not decomposable (AVG(AVG(x)) ≠ AVG(x)).
+  // Instead we carry SUM(col) and COUNT(col) per pre-agg cell and divide:
+  //   SUM(__preagg_sum_col) / NULLIF(SUM(__preagg_count_col), 0)
+  // The pre-agg subquery injects these columns via scanForSpineRawColAvgs().
+  // Named measures (already redefined as AVG(__preagg_<name>)) start with
+  // '__preagg_' and fall through to the normal code path below.
+  if (expr.e?.node === 'field') {
+    const path = (expr.e as FieldnameNode).path;
+    if (path && path.length >= 1) {
+      const colName = path[path.length - 1];
+      if (!colName.startsWith('__preagg_')) {
+        const structPath =
+          expr.structPath && expr.structPath.length > 0
+            ? expr.structPath
+            : path.length >= 2
+              ? path.slice(0, -1)
+              : undefined;
+        let struct: QueryStruct | undefined;
+        if (structPath) {
+          try {
+            struct = context.getStructByName(structPath);
+          } catch {
+            struct = undefined;
+          }
+        }
+        if (struct && (struct.structDef as JoinBase).isSpinePreAgg) {
+          const sumCol = `__preagg_sum_${colName}`;
+          const countCol = `__preagg_count_${colName}`;
+          const sumRef = struct.dialect.sqlFieldReference(
+            struct.getIdentifier(),
+            'table',
+            sumCol,
+            'number'
+          );
+          const countRef = struct.dialect.sqlFieldReference(
+            struct.getIdentifier(),
+            'table',
+            countCol,
+            'number'
+          );
+          if (state.whereSQL) {
+            return (
+              `SUM(CASE WHEN ${state.whereSQL} THEN ${sumRef} END)` +
+              ` / NULLIF(SUM(CASE WHEN ${state.whereSQL} THEN ${countRef} END), 0)`
+            );
+          }
+          return `SUM(${sumRef}) / NULLIF(SUM(${countRef}), 0)`;
+        }
+      }
+    }
+  }
   const dimSQL = generateDimFragment(resultSet, context, expr.e, state);
   const distinctKeySQL = generateDistinctKeyIfNecessary(
     resultSet,
@@ -974,13 +1114,30 @@ export function generateCountFragment(
   expr: AggregateExpr,
   state: GenerateState
 ): string {
-  let func = 'COUNT(';
-  let thing = '1';
-
   let struct = context;
   if (expr.structPath) {
     struct = context.getStructByName(expr.structPath);
   }
+
+  // Spine fact joins pre-aggregate COUNT(*) AS __preagg_count per cell.
+  // Use COALESCE(SUM(__preagg_count), 0) for true row counts instead of
+  // COUNT(DISTINCT __distinct_key) which only yields 0 or 1.
+  if ((struct.structDef as JoinBase).isSpinePreAgg) {
+    const preaggRef = struct.dialect.sqlFieldReference(
+      struct.getIdentifier(),
+      'table',
+      '__preagg_count',
+      'number'
+    );
+    if (state.whereSQL) {
+      return `COALESCE(SUM(CASE WHEN ${state.whereSQL} THEN ${preaggRef} END), 0)`;
+    }
+    return `COALESCE(SUM(${preaggRef}), 0)`;
+  }
+
+  let func = 'COUNT(';
+  let thing = '1';
+
   const joinName = struct.getJoinableParent().getIdentifier();
   const join = resultSet.root().joins.get(joinName);
   if (!join) {

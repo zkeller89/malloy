@@ -402,6 +402,14 @@ export class MySQLDialect extends Dialect {
     return 'LOCALTIMESTAMP';
   }
 
+  sqlDateSpineSQL(_start: string, _end: string, _grain: string): string {
+    throw new Error('spine_composite is not yet supported on MySQL');
+  }
+
+  sqlDateTruncToGrain(_grain: string, _expr: string): string {
+    throw new Error('spine_composite is not yet supported on MySQL');
+  }
+
   sqlConvertToCivilTime(
     expr: string,
     timezone: string,

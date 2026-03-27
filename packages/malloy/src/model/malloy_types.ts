@@ -1049,6 +1049,7 @@ export interface JoinBase {
   onExpression?: Expr;
   fieldUsage?: FieldUsage[];
   accessModifier?: NonDefaultAccessModifierLabel | undefined;
+  isSpinePreAgg?: boolean; // set on spine fact joins; count() → SUM(__preagg_count)
 }
 
 export type Joinable =
@@ -1381,6 +1382,28 @@ export interface CompositeSourceDef extends SourceDefBase {
   sources: SourceDef[];
 }
 
+export interface SpineGroupField {
+  alias: string; // composite-level name (appears in queries, spine × groups UNION)
+  column: string; // physical column name (fallback when fieldExpr is absent)
+  fieldExpr?: Expr; // set when column references a computed dimension
+}
+
+export interface SpineFactJoin {
+  sourceRef: string; // name of the fact source in the model
+  alias: string; // unique SQL alias e.g. 'flights__dep_time'
+  dateField: string; // physical column name to DATE_TRUNC against spine_date
+  groupFields: SpineGroupField[];
+}
+
+export interface SpineJoinDef extends SourceDefBase {
+  type: 'spine_join';
+  spineStart: string;
+  spineEnd: string;
+  // grain comes from runtime arguments (same parameter as the wrapping composite)
+  spineFactJoins: SpineFactJoin[];
+  // fields: [spine_date: timestamp, ...group dims (deduplicated by alias), ...measures]
+}
+
 /*
  * Malloy has a kind of "strings" which is a list of segments. Each segment
  * is either a string, or a query, which is meant to be replaced
@@ -1489,7 +1512,8 @@ export function isSourceDef(sd: NamedModelObject | FieldDef): sd is SourceDef {
     sd.type === 'query_result' ||
     sd.type === 'finalize' ||
     sd.type === 'nest_source' ||
-    sd.type === 'composite'
+    sd.type === 'composite' ||
+    sd.type === 'spine_join'
   );
 }
 
@@ -1511,7 +1535,8 @@ export type SourceDef =
   | QueryResultDef
   | FinalizeSourceDef
   | NestSourceDef
-  | CompositeSourceDef;
+  | CompositeSourceDef
+  | SpineJoinDef;
 
 /** Sources that can be persisted (materialized to tables) */
 export type PersistableSourceDef = SQLSourceDef | QuerySourceDef;
