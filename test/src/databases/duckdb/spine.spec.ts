@@ -371,6 +371,42 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
     );
   });
 
+  it('raw column .min() / .max() on fact join: decompose via pre-agg', async () => {
+    // dep.distance.min() / .max() are raw column aggregates — fully decomposable.
+    // Pre-agg carries MIN(distance) and MAX(distance) per cell; outer emits MIN/MAX of those.
+    // Jan: A has 2 events (100, 200) → min=100, max=200; B has 1 event (50) → min=50, max=50.
+    // Feb: zero-fill → min=null, max=null (correct for empty set, no COALESCE).
+    await expect(`
+      ##! experimental { composite_sources parameters }
+      source: events_minmax is duckdb.sql("""
+        SELECT * FROM (VALUES
+          ('A', TIMESTAMP '2020-01-10', 100),
+          ('A', TIMESTAMP '2020-01-20', 200),
+          ('B', TIMESTAMP '2020-01-15', 50)
+        ) t(category, event_date, distance)
+      """)
+      spine_composite: minmax_spine(grain::string) {
+        spine_start: @2020-01-01
+        spine_end: @2020-02-28
+        spine_join: dep is events_minmax {
+          spine_date: event_date
+          spine_group: category
+        }
+      }
+      run: minmax_spine(grain is 'month') -> {
+        group_by: spine_date, category
+        aggregate: min_dist is dep.distance.min(), max_dist is dep.distance.max()
+        order_by: spine_date, category
+      }
+    `).toMatchResult(
+      testModel,
+      {category: 'A', min_dist: 100,  max_dist: 200},  // Jan: min 100, max 200
+      {category: 'B', min_dist: 50,   max_dist: 50},   // Jan: only 50
+      {category: 'A', min_dist: null, max_dist: null}, // Feb: zero-fill → null
+      {category: 'B', min_dist: null, max_dist: null}  // Feb: zero-fill → null
+    );
+  });
+
   it('multiple spine_group: dims produce correct (date × carrier × region) grid', async () => {
     // Only 2 distinct (carrier, region) pairs exist: (A, east) and (B, west).
     // DISTINCT groups gives those 2 pairs (not a 2×2 cross product) × 2 months = 4 rows.
