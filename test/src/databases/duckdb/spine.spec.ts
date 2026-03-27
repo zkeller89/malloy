@@ -334,6 +334,43 @@ describe.each(runtimes.runtimeList)('%s', (_databaseName, runtime) => {
     );
   });
 
+  it('raw column .avg() on fact join: decomposes into SUM/COUNT pre-agg', async () => {
+    // dep.distance.avg() is a raw column average — not decomposable as AVG(AVG(x)).
+    // Pre-agg carries SUM(distance) and COUNT(distance) per (spine_date, category) cell;
+    // the outer query emits SUM(__preagg_sum_distance) / NULLIF(SUM(__preagg_count_distance), 0).
+    // Jan: A has 2 events (100, 200) → avg = 150; B has 1 event (50) → avg = 50.
+    // Feb: zero-fill → avg = null (no rows, division produces null).
+    await expect(`
+      ##! experimental { composite_sources parameters }
+      source: events_avg is duckdb.sql("""
+        SELECT * FROM (VALUES
+          ('A', TIMESTAMP '2020-01-10', 100),
+          ('A', TIMESTAMP '2020-01-20', 200),
+          ('B', TIMESTAMP '2020-01-15', 50)
+        ) t(category, event_date, distance)
+      """)
+      spine_composite: avg_spine(grain::string) {
+        spine_start: @2020-01-01
+        spine_end: @2020-02-28
+        spine_join: dep is events_avg {
+          spine_date: event_date
+          spine_group: category
+        }
+      }
+      run: avg_spine(grain is 'month') -> {
+        group_by: spine_date, category
+        aggregate: avg_dist is dep.distance.avg()
+        order_by: spine_date, category
+      }
+    `).toMatchResult(
+      testModel,
+      {category: 'A', avg_dist: 150},  // Jan: (100 + 200) / 2
+      {category: 'B', avg_dist: 50},   // Jan: 50 / 1
+      {category: 'A', avg_dist: null}, // Feb: zero-fill → null
+      {category: 'B', avg_dist: null}  // Feb: zero-fill → null
+    );
+  });
+
   it('multiple spine_group: dims produce correct (date × carrier × region) grid', async () => {
     // Only 2 distinct (carrier, region) pairs exist: (A, east) and (B, west).
     // DISTINCT groups gives those 2 pairs (not a 2×2 cross product) × 2 months = 4 rows.
