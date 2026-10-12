@@ -77,6 +77,7 @@ TOP: T O P SPACE_CHAR* ':';
 WHERE: W H E R E SPACE_CHAR* ':';
 VIEW: V I E W SPACE_CHAR* ':' ;
 TIMEZONE: T I M E Z O N E SPACE_CHAR* ':';
+SPINE_RANGE: S P I N E '_' R A N G E SPACE_CHAR* ':';
 
 // bare keywords
 ALL: A L L;
@@ -90,6 +91,7 @@ CASE: C A S E ;
 CAST: C A S T ;
 COUNT: C O U N T ;
 COMPOSE: C O M P O S E ;
+DATE_SPINE: D A T E '_' S P I N E ;
 DATE: D A T E;
 DAY: D A Y S?;
 DESC: D E S C ;

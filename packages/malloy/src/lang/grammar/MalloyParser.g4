@@ -242,10 +242,33 @@ exploreStatement
   | (ACCEPT | EXCEPT) fieldNameList          # defExploreEditField
   | tags accessLabel? VIEW subQueryDefList   # defExploreQuery
   | timezoneStatement                        # defExploreTimezone
+  | FROM id dateSpineMemberBody              # defDateSpineFrom
+  | SPINE_RANGE fieldExpr                    # defDateSpineRange
   | annotation+                              # defExploreAnnotation
   | ignoredModelAnnotations                  # defIgnoreModel_stub
   ;
 
+
+dateSpineMemberBody
+  : OCURLY (dateSpineMemberStatement | SEMI)* CCURLY
+  ;
+
+dateSpineMemberStatement
+  : tags DIMENSION spineDimDef (COMMA? spineDimDef)* COMMA?             # spineFromDimensions
+  | tags MEASURE tetheredMeasureDef (COMMA? tetheredMeasureDef)* COMMA? # spineFromMeasures
+  | annotation+                                                         # spineFromAnnotation
+  ;
+
+spineDimDef
+  : tags fieldNameDef (isDefine fieldExpr)?
+  ;
+
+// `at` and `default` are contextual words, not keywords, so that columns
+// with those names stay legal everywhere else. The visitor checks the text.
+tetheredMeasureDef
+  : tags fieldNameDef isDefine fieldExpr
+    (atKw=id tetherAt=fieldExpr (defaultKw=id tetherDefault=fieldExpr)?)?
+  ;
 
 accessLabel
   : PUBLIC_KW
@@ -322,6 +345,7 @@ sqExpr
   : id sourceArguments?                                      # SQID
   | OPAREN sqExpr CPAREN                                     # SQParens
   | COMPOSE OPAREN (sqExpr (COMMA sqExpr)*)? CPAREN          # SQCompose
+  | DATE_SPINE OPAREN sqExpr (COMMA sqExpr)* CPAREN          # SQDateSpine
   | sqExpr PLUS segExpr                                      # SQRefinedQuery
   | sqExpr ARROW segExpr                                     # SQArrow
   | sqExpr (INCLUDE includeBlock)? EXTEND exploreProperties  # SQExtendedSource
@@ -592,6 +616,7 @@ badWord
   : fieldName
   | timeframe
   | ALL | AND | AS | AVG | BOOLEAN | BY | CASE | CAST | COUNT | COMPOSE | DATE
+  | DATE_SPINE
   | DISTINCT | ELSE | END | EXCLUDE | EXPORT | EXTEND | FALSE | FILTER | FULL
   | FOR | FROM | HAS | IMPORT | INCLUDE | INNER | IS | IN | INTERNAL_KW | JSON
   | LEFT | LIKE | MAX | MIN | NOT | NOW | NULL | NUMBER | ON | OR | PICK

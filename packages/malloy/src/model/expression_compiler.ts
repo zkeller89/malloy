@@ -305,6 +305,12 @@ function compileExpr<T extends Expr>(
       // code currently before the composite source is resolved in some cases
       case 'compositeField':
         return '{COMPOSITE_FIELD}';
+      case 'dateSpineMeasure':
+        throw new MalloyCompileError(
+          `Measure '${expr.name}' is tethered to a date_spine and can only be used in a query on that date_spine`,
+          'date-spine-measure-outside-spine',
+          undefined
+        );
       case 'filterMatch':
         return generateAppliedFilter(context, expr, qi);
       case 'filterLiteral':

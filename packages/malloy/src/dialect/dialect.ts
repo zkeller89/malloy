@@ -4,6 +4,7 @@
  */
 
 import type {
+  DateUnit,
   Expr,
   Sampling,
   AtomicTypeDef,
@@ -487,6 +488,24 @@ export abstract class Dialect {
 
   // returns an table that is a 0 based array of numbers
   abstract sqlGroupSetTable(groupSetCount: number): string;
+
+  /** Whether `sqlDateSeries` is implemented, for date_spine sources */
+  supportsDateSpine = false;
+
+  /**
+   * A SELECT returning one DATE column `col`, one row per `unit` from `lo`
+   * to `hi` inclusive. `boundsSQL` is a SELECT with one row and DATE
+   * columns `lo` and `hi`, already truncated to `unit`; if they are NULL
+   * the result is empty. Used by date_spine sources.
+   */
+  sqlDateSeries(_boundsSQL: string, _unit: DateUnit, _col: string): string {
+    throw new Error(`date_spine is not supported on ${this.name}`);
+  }
+
+  /** `a = b`, where NULL equals NULL */
+  sqlNullSafeEquals(a: string, b: string): string {
+    return `${a} IS NOT DISTINCT FROM ${b}`;
+  }
 
   // aggregate function that return the ANY NON NULL value encountered
   abstract sqlAnyValue(groupSet: number, fieldName: string): string;

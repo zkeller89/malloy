@@ -10,6 +10,8 @@ import type {View} from '../view-elements/view';
 import {QueryBase} from './query-base';
 import {computeQueryGivenUsage} from '../../composite-source-utils';
 import {detectAndRemovePartialStages} from '../query-utils';
+import {resolveDateSpine} from '../../date-spine-utils';
+import type {SourceDef} from '../../../model/malloy_types';
 
 /**
  * A query operation that consists of an exisitng query with refinements.
@@ -36,15 +38,26 @@ export class QueryRefine extends QueryBase implements QueryElement {
       q.query.pipeline,
       undefined
     );
+    let spineResolved: SourceDef | undefined;
+    if (
+      q.inputStruct.type === 'date_spine' &&
+      !isPartialOk &&
+      pipeline[0] !== undefined
+    ) {
+      const resolved = resolveDateSpine(q.inputStruct, pipeline[0], this);
+      if (resolved) {
+        pipeline[0] = resolved.stage;
+        spineResolved = resolved.sourceDef;
+      }
+    }
+
     const query = {
       ...q.query,
       pipeline,
     };
 
-    const compositeResolvedSourceDef = this.resolveCompositeSource(
-      q.inputStruct,
-      pipeline
-    );
+    const compositeResolvedSourceDef =
+      spineResolved ?? this.resolveCompositeSource(q.inputStruct, pipeline);
 
     const pipelineWithExpandedFieldUsage = this.expandRefUsage(
       compositeResolvedSourceDef ?? q.inputStruct,

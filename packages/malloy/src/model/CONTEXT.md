@@ -355,6 +355,16 @@ than a join of its own.
 `this.firstSegment.expandedFieldUsage` is in hand in any method of the class,
 including SQL generation.
 
+## date_spine sources
+
+A `DateSpineSourceDef` reaches the compiler only once it is resolved; `plan` is set by the translator (see [../lang/CONTEXT.md](../lang/CONTEXT.md)). `QueryQuery.dateSpineSQL` writes this SQL:
+
+1. **Pre-aggregations.** Each `plan.preaggs[].query` becomes a stage. Every one outputs `__ds_date`, then `__ds_k0…` (the keys), then one column per tethered measure.
+2. **Spine.** One final stage builds `dialect.sqlDateSeries(bounds)` × `UNION` of the key columns. The bounds are `plan.range`, or else the min/max of `__ds_date` across the pre-aggregations.
+3. **Joins.** Each pre-aggregation is LEFT JOINed onto the spine with `sqlNullSafeEquals` on the keys.
+
+Dialects opt in with `supportsDateSpine`; others raise `date-spine-unsupported-dialect`. An unresolved `dateSpineMeasure` node is a `MalloyCompileError`.
+
 ## Compilation Pipeline
 
 ```
