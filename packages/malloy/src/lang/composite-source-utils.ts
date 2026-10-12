@@ -1606,6 +1606,15 @@ export function givenUsageOfSource(sd: SourceDef): GivenUsage {
         ...fromFilters,
         ...sd.sources.flatMap(s => givenUsageOfSource(s)),
       ];
+    case 'date_spine':
+      // Resolved: exactly the pre-aggregations this query runs.
+      // Unresolved: anything a member might need.
+      return [
+        ...fromFilters,
+        ...(sd.plan
+          ? sd.plan.preaggs.flatMap(p => p.query.givenUsage ?? [])
+          : sd.members.flatMap(m => givenUsageOfSource(m.def))),
+      ];
     default:
       // table, query_result, finalize, nest_source, virtual — no embedded Query.
       // (query_result/finalize/nest_source are pipeline-internal and only seen

@@ -628,6 +628,12 @@ export class Explore extends Entity implements Taggable {
       }
       return sources;
     }
+    if (structDef.type === 'date_spine') {
+      for (const member of structDef.members) {
+        sources.push(...this.collectSourceComponents(member.def));
+      }
+      return sources;
+    }
     if (isSourceComponent(structDef)) {
       if (structDef.type === 'table') {
         sources.push({

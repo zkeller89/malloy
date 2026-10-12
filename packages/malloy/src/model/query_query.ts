@@ -11,6 +11,7 @@ import type {
 } from '../dialect';
 import {exprToSQL} from './expression_compiler';
 import type {
+  DateSpineSourceDef,
   TurtleDef,
   IndexFieldDef,
   IndexSegment,
@@ -900,6 +901,8 @@ export class QueryQuery extends QueryField {
         // TODO: throw an error here; not simple because we call into this
         // code currently before the composite source is resolved in some cases
         return '{COMPOSITE SOURCE}';
+      case 'date_spine':
+        return this.dateSpineSQL(qs, qs.structDef, stageWriter);
       case 'finalize':
         return qs.structDef.name;
       case 'sql_select': {
@@ -945,6 +948,94 @@ export class QueryQuery extends QueryField {
           `Cannot create SQL StageWriter from '${activeName(qs.structDef)}' type '${qs.structDef.type}`
         );
     }
+  }
+
+  /**
+   * A resolved date_spine: each pre-aggregation becomes a stage, then one
+   * more stage crosses a generated date series with every observed key
+   * combination and LEFT JOINs each pre-aggregation onto it.
+   */
+  protected dateSpineSQL(
+    qs: QueryStruct,
+    def: DateSpineSourceDef,
+    stageWriter: StageWriter
+  ): string {
+    const plan = def.plan;
+    if (plan === undefined) {
+      throw new MalloyCompileError(
+        'A date_spine can only be queried directly with group_by and aggregate',
+        'date-spine-unresolved',
+        def.location
+      );
+    }
+    const dialect = this.parent.dialect;
+    if (plan.grain !== undefined && !dialect.supportsDateSpine) {
+      throw new MalloyCompileError(
+        `date_spine is not supported on ${dialect.name} yet`,
+        'date-spine-unsupported-dialect',
+        def.location
+      );
+    }
+    const q = (name: string) => dialect.sqlQuoteIdentifier(name);
+    const dateCol = q('__ds_date');
+    const keyCols = plan.keys.map((_k, i) => q(`__ds_k${i}`));
+
+    const preaggs = plan.preaggs.map((p, i) => ({
+      alias: `__ds_p${i}`,
+      sql: this.compileQueryToStages(
+        p.query,
+        qs.prepareResultOptions ?? {},
+        stageWriter,
+        false
+      ).lastStageName,
+      measureCols: p.measureCols,
+    }));
+
+    const select: string[] = [];
+    const from: string[] = [];
+    const joinOn = (alias: string) => {
+      const on: string[] = [];
+      if (plan.grain !== undefined) {
+        on.push(`${alias}.${dateCol} = __ds_dates.${dateCol}`);
+      }
+      for (const k of keyCols) {
+        on.push(dialect.sqlNullSafeEquals(`${alias}.${k}`, `__ds_keys.${k}`));
+      }
+      return on.length > 0 ? on.join(' AND ') : '1=1';
+    };
+
+    if (plan.grain !== undefined) {
+      const qi = {queryTimezone: undefined};
+      const bounds = plan.range
+        ? `SELECT ${dialect.sqlDateLiteral(qi, plan.range.from)} AS lo, ${dialect.sqlDateLiteral(qi, plan.range.to)} AS hi`
+        : `SELECT MIN(${dateCol}) AS lo, MAX(${dateCol}) AS hi FROM (${preaggs
+            .map(p => `SELECT ${dateCol} FROM ${p.sql} AS ${p.alias}`)
+            .join(' UNION ALL ')}) AS __ds_all`;
+      from.push(
+        `(${dialect.sqlDateSeries(bounds, plan.grain, dateCol)}) AS __ds_dates`
+      );
+      select.push(`__ds_dates.${dateCol} AS ${q('dspine')}`);
+    }
+    if (keyCols.length > 0) {
+      const keys = preaggs
+        .map(p => `SELECT ${keyCols.join(', ')} FROM ${p.sql} AS ${p.alias}`)
+        .join(' UNION ');
+      from.push(`(${keys}) AS __ds_keys`);
+      plan.keys.forEach((name, i) =>
+        select.push(`__ds_keys.${keyCols[i]} AS ${q(name)}`)
+      );
+    }
+    if (from.length === 0) {
+      from.push('(SELECT 1 AS __ds_one) AS __ds_one');
+    }
+    let sql = `FROM ${from.join('\nCROSS JOIN ')}`;
+    for (const p of preaggs) {
+      sql += `\nLEFT JOIN ${p.sql} AS ${p.alias} ON ${joinOn(p.alias)}`;
+      for (const m of p.measureCols) {
+        select.push(`${p.alias}.${q(m.col)} AS ${q(`__ds_m_${m.tether}`)}`);
+      }
+    }
+    return stageWriter.addStage(`SELECT\n  ${select.join(',\n  ')}\n${sql}\n`);
   }
 
   /**

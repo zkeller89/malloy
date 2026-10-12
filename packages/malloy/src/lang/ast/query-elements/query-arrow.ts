@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import type {Query, StructDef} from '../../../model/malloy_types';
+import type {Query, SourceDef, StructDef} from '../../../model/malloy_types';
 import {refIsStructDef} from '../../../model/malloy_types';
 import {Source} from '../source-elements/source';
 import {StaticSourceSpace} from '../field-space/static-space';
@@ -17,6 +17,7 @@ import {
   computeQueryGivenUsage,
 } from '../../composite-source-utils';
 import {detectAndRemovePartialStages} from '../query-utils';
+import {resolveDateSpine} from '../../date-spine-utils';
 
 /**
  * A query operation that adds segments to a LHS source or query.
@@ -69,6 +70,22 @@ export class QueryArrow extends QueryBase implements QueryElement {
       name,
     } = this.view.pipelineComp(fieldSpace);
 
+    // A date_spine is resolved once the first stage is final; a partial
+    // stage may still be refined, and resolution rewrites it.
+    let spineResolved: SourceDef | undefined;
+    if (
+      this.source instanceof Source &&
+      inputStruct.type === 'date_spine' &&
+      !isPartialOk &&
+      rhsPipeline[0] !== undefined
+    ) {
+      const resolved = resolveDateSpine(inputStruct, rhsPipeline[0], this);
+      if (resolved) {
+        rhsPipeline[0] = resolved.stage;
+        spineResolved = resolved.sourceDef;
+      }
+    }
+
     const query = {
       ...queryBase,
       name,
@@ -78,6 +95,7 @@ export class QueryArrow extends QueryBase implements QueryElement {
 
     const compositeResolvedSourceDef =
       query.compositeResolvedSourceDef ??
+      spineResolved ??
       this.resolveCompositeSource(inputStruct, rhsPipeline);
 
     const segment = query.pipeline[0];
