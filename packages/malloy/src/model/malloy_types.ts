@@ -108,6 +108,7 @@ export type Expr =
   | InCompareExpr
   | InGivenExpr
   | CompositeFieldExpr
+  | DateSpineMeasureExpr
   | ErrorNode;
 
 export type BinaryOperator =
@@ -447,6 +448,16 @@ export interface CaseExpr extends ExprWithKids {
 
 export interface CompositeFieldExpr extends ExprLeaf {
   node: 'compositeField';
+}
+
+/**
+ * Placeholder for a tethered measure on an unresolved date_spine source.
+ * Resolution against a query replaces it with a read of the pre-aggregated
+ * column; reaching the SQL compiler with one is an error.
+ */
+export interface DateSpineMeasureExpr extends ExprLeaf {
+  node: 'dateSpineMeasure';
+  name: string;
 }
 
 export interface InCompareExpr extends ExprWithKids {
@@ -1531,6 +1542,60 @@ export interface CompositeSourceDef extends SourceDefBase {
   sources: SourceDef[];
 }
 
+/**
+ * A measure on a date_spine, computed in one member source and grouped by a
+ * date in that member. `expr` and `at` are rooted in the member's (extended)
+ * source def.
+ */
+export interface DateSpineTether {
+  name: string;
+  member: number;
+  at: Expr;
+  atRefSummary?: RefSummary;
+  atType: 'date' | 'timestamp' | 'timestamptz';
+  default?: Expr;
+}
+
+export interface DateSpineSharedDim {
+  name: string;
+  /** indexes of the members which map this dimension */
+  mappedIn: number[];
+}
+
+/** One pre-aggregation of a member, grouped by one tether date */
+export interface DateSpinePreAgg {
+  query: Query;
+  /** tether name -> output column of `query` holding its value */
+  measureCols: {tether: string; col: string}[];
+}
+
+/**
+ * Built by the translator for one query on a date_spine. Every pre-agg
+ * outputs `__ds_date` (when there is a grain) and the key columns.
+ */
+export interface DateSpinePlan {
+  grain?: DateUnit;
+  /** names of the key columns, shared by every pre-agg and the spine */
+  keys: string[];
+  preaggs: DateSpinePreAgg[];
+  /** pinned range, ISO dates, already truncated to the grain */
+  range?: {from: string; to: string};
+}
+
+/**
+ * `date_spine(a, b, ...)`. Unresolved, it describes the members, tethered
+ * measures and shared dimensions. Resolved against one query, `plan` is
+ * set and `fields` are the columns of the joined spine.
+ */
+export interface DateSpineSourceDef extends SourceDefBase {
+  type: 'date_spine';
+  members: {name: string; def: SourceDef}[];
+  tethers: DateSpineTether[];
+  sharedDims: DateSpineSharedDim[];
+  spineRange?: {from: string; to: string};
+  plan?: DateSpinePlan;
+}
+
 // the name: of a virtual source def is the key to the virtualMap
 export interface VirtualSourceDef extends SourceDefBase {
   type: 'virtual';
@@ -1653,7 +1718,8 @@ export function isSourceDef(sd: NamedModelObject | FieldDef): sd is SourceDef {
     sd.type === 'finalize' ||
     sd.type === 'nest_source' ||
     sd.type === 'virtual' ||
-    sd.type === 'composite'
+    sd.type === 'composite' ||
+    sd.type === 'date_spine'
   );
 }
 
@@ -1680,7 +1746,8 @@ export type SourceDef =
   | FinalizeSourceDef
   | NestSourceDef
   | VirtualSourceDef
-  | CompositeSourceDef;
+  | CompositeSourceDef
+  | DateSpineSourceDef;
 
 /** Sources that can be persisted (materialized to tables) */
 export type PersistableSourceDef = SQLSourceDef | QuerySourceDef;

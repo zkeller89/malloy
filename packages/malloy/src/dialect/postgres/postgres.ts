@@ -5,6 +5,7 @@
 
 import {indent} from '../../model/utils';
 import type {
+  DateUnit,
   Sampling,
   AtomicTypeDef,
   TypecastExpr,
@@ -114,6 +115,17 @@ export class PostgresDialect extends PostgresBase {
 
   sqlGroupSetTable(groupSetCount: number): string {
     return `CROSS JOIN GENERATE_SERIES(0,${groupSetCount},1) as group_set`;
+  }
+
+  override supportsDateSpine = true;
+
+  override sqlDateSeries(
+    boundsSQL: string,
+    unit: DateUnit,
+    col: string
+  ): string {
+    const step = unit === 'quarter' ? '3 month' : `1 ${unit}`;
+    return `SELECT CAST(GENERATE_SERIES(CAST(lo AS TIMESTAMP), CAST(hi AS TIMESTAMP), INTERVAL '${step}') AS DATE) AS ${col} FROM (${boundsSQL}) AS __ds_bounds`;
   }
 
   sqlAnyValue(groupSet: number, fieldName: string): string {

@@ -4,6 +4,7 @@
  */
 
 import type {
+  DateUnit,
   Sampling,
   AtomicTypeDef,
   RegexMatchExpr,
@@ -119,6 +120,17 @@ export class DuckDBDialect extends PostgresBase {
 
   sqlAnyValue(groupSet: number, fieldName: string): string {
     return `FIRST(${fieldName}) FILTER (WHERE ${fieldName} IS NOT NULL)`;
+  }
+
+  override supportsDateSpine = true;
+
+  override sqlDateSeries(
+    boundsSQL: string,
+    unit: DateUnit,
+    col: string
+  ): string {
+    const step = unit === 'quarter' ? '3 month' : `1 ${unit}`;
+    return `SELECT CAST(UNNEST(GENERATE_SERIES(CAST(lo AS TIMESTAMP), CAST(hi AS TIMESTAMP), INTERVAL '${step}')) AS DATE) AS ${col} FROM (${boundsSQL}) AS __ds_bounds`;
   }
 
   // DuckDB WASM has an issue with returning invalid DecimalBigNum
