@@ -26,6 +26,12 @@ import {TimezoneStatement} from '../source-properties/timezone-statement';
 import {ObjectAnnotation} from '../types/annotation-elements';
 import {Renames} from '../source-properties/renames';
 import type {MakeEntry} from '../types/space-entry';
+import {
+  applyDateSpineMembers,
+  checkDateSpineFields,
+  DateSpineFrom,
+  DateSpineRange,
+} from './date-spine-source';
 import {ParameterSpace} from '../field-space/parameter-space';
 import {JoinStatement} from '../source-properties/join';
 import type {IncludeItem} from '../source-query-elements/include-item';
@@ -65,6 +71,8 @@ export class RefinedSource extends Source {
     const fields: MakeEntry[] = [];
     const filters: Filter[] = [];
     let newTimezone: string | undefined;
+    const spineFroms: DateSpineFrom[] = [];
+    let spineRange: DateSpineRange | undefined;
 
     const inlineAccessModifiers: {
       access: AccessModifierLabel;
@@ -107,6 +115,13 @@ export class RefinedSource extends Source {
         filters.push(el);
       } else if (el instanceof TimezoneStatement) {
         newTimezone = el.timezoneName();
+      } else if (el instanceof DateSpineFrom) {
+        spineFroms.push(el);
+      } else if (el instanceof DateSpineRange) {
+        if (spineRange) {
+          el.logError('date-spine-range-invalid', 'spine_range: already set');
+        }
+        spineRange = el;
       } else {
         errTo.logError(
           'unexpected-source-property',
@@ -116,7 +131,29 @@ export class RefinedSource extends Source {
     }
 
     const paramSpace = pList ? new ParameterSpace(pList) : undefined;
-    const baseSourceDef = this.source.getSourceDef(paramSpace);
+    let baseSourceDef = this.source.getSourceDef(paramSpace);
+    if (baseSourceDef.type === 'date_spine') {
+      for (const el of this.refinement.list) {
+        if (el instanceof JoinStatement) {
+          el.logError(
+            'date-spine-invalid-member',
+            'A date_spine cannot have joins; add sources to date_spine(...) instead'
+          );
+        }
+      }
+      baseSourceDef = applyDateSpineMembers(
+        baseSourceDef,
+        spineFroms,
+        spineRange
+      );
+    } else {
+      for (const el of [...spineFroms, ...(spineRange ? [spineRange] : [])]) {
+        el.logError(
+          'date-spine-from-requires-date-spine',
+          `'${el instanceof DateSpineFrom ? 'from' : 'spine_range:'}' can only be used when extending a date_spine`
+        );
+      }
+    }
     // Track the sourceID of the base source for extends tracking
     const baseSourceID = isPersistableSourceDef(baseSourceDef)
       ? baseSourceDef.sourceID
@@ -157,6 +194,13 @@ export class RefinedSource extends Source {
     fs.addAccessModifiers(thisIncludeState.modifiers);
     fs.addNotes(thisIncludeState.notes);
     const retStruct = fs.structDef();
+    if (retStruct.type === 'date_spine') {
+      const baseNames = new Set(baseSourceDef.fields.map(f => f.as ?? f.name));
+      checkDateSpineFields(
+        retStruct.fields.filter(f => !baseNames.has(f.as ?? f.name)),
+        this.refinement
+      );
+    }
 
     // Clone the filterList to avoid mutating the original source's filters
     const filterList = retStruct.filterList ? [...retStruct.filterList] : [];

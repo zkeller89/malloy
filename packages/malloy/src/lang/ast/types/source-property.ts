@@ -13,6 +13,10 @@ import type {MalloyElement} from './malloy-element';
 import {TimezoneStatement} from '../source-properties/timezone-statement';
 import {ObjectAnnotation} from './annotation-elements';
 import {JoinStatement} from '../source-properties/join';
+import {
+  DateSpineFrom,
+  DateSpineRange,
+} from '../source-elements/date-spine-source';
 
 export type SourceProperty =
   | Filter
@@ -23,7 +27,9 @@ export type SourceProperty =
   | PrimaryKey
   | ObjectAnnotation
   | Views
-  | TimezoneStatement;
+  | TimezoneStatement
+  | DateSpineFrom
+  | DateSpineRange;
 export function isSourceProperty(p: MalloyElement): p is SourceProperty {
   return (
     p instanceof Filter ||
@@ -34,6 +40,8 @@ export function isSourceProperty(p: MalloyElement): p is SourceProperty {
     p instanceof PrimaryKey ||
     p instanceof ObjectAnnotation ||
     p instanceof Views ||
-    p instanceof TimezoneStatement
+    p instanceof TimezoneStatement ||
+    p instanceof DateSpineFrom ||
+    p instanceof DateSpineRange
   );
 }

@@ -9,6 +9,7 @@ export * from './statements/define-user-type';
 export * from './statements/define-query';
 export * from './source-elements/source';
 export * from './source-elements/refined-source';
+export * from './source-elements/date-spine-source';
 export * from './source-query-elements/source-query-element';
 export * from './source-query-elements/sq-arrow';
 export * from './source-query-elements/sq-refine';
@@ -17,6 +18,7 @@ export * from './source-query-elements/sq-reference';
 export * from './source-query-elements/sq-extend';
 export * from './source-query-elements/sq-typed-source';
 export * from './source-query-elements/sq-compose';
+export * from './source-query-elements/sq-date-spine';
 export * from './source-query-elements/include-item';
 
 export * from './source-properties/field-list-edit';

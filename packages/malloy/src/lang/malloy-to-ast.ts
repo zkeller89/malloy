@@ -2449,6 +2449,126 @@ export class MalloyToAST
     return this.astAt(new ast.SQCompose(sources), pcx);
   }
 
+  visitSQDateSpine(pcx: parse.SQDateSpineContext) {
+    const members = pcx.sqExpr().map(sqExpr => this.getSqExpr(sqExpr));
+    this.inExperiment('date_spine', pcx);
+    return this.astAt(new ast.SQDateSpine(members), pcx);
+  }
+
+  visitDefDateSpineFrom(pcx: parse.DefDateSpineFromContext): ast.DateSpineFrom {
+    this.inExperiment('date_spine', pcx);
+    const dimensions: ast.DimensionFieldDeclaration[] = [];
+    const measures: ast.DateSpineTetherDecl[] = [];
+    for (const stmt of pcx.dateSpineMemberBody().dateSpineMemberStatement()) {
+      const dimsCx = stmt as Partial<parse.SpineFromDimensionsContext>;
+      const measuresCx = stmt as Partial<parse.SpineFromMeasuresContext>;
+      if (dimsCx.spineDimDef && dimsCx.tags) {
+        const blockNotes = this.getNotes(dimsCx.tags());
+        for (const dcx of dimsCx.spineDimDef()) {
+          dimensions.push(this.getSpineDimDef(dcx, blockNotes));
+        }
+      } else if (measuresCx.tetheredMeasureDef && measuresCx.tags) {
+        const blockNotes = this.getNotes(measuresCx.tags());
+        for (const mcx of measuresCx.tetheredMeasureDef()) {
+          measures.push(this.getTetheredMeasureDef(mcx, blockNotes));
+        }
+      }
+      // Lone annotations in a from block are comments
+    }
+    const from = new ast.DateSpineFrom(getId(pcx), dimensions, measures);
+    return this.astAt(from, pcx);
+  }
+
+  protected getSpineDimDef(
+    pcx: parse.SpineDimDefContext,
+    blockNotes: Note[]
+  ): ast.DimensionFieldDeclaration {
+    const name = getId(pcx.fieldNameDef());
+    const exprCx = pcx.fieldExpr();
+    let def: ast.DimensionFieldDeclaration;
+    if (exprCx) {
+      def = new ast.DimensionFieldDeclaration(
+        this.getFieldExpr(exprCx),
+        name,
+        this.getSourceCode(exprCx)
+      );
+    } else {
+      // `dimension: department` maps the member's own field of that name
+      const ref = this.astAt(
+        new ast.ExpressionFieldReference([
+          this.astAt(new ast.FieldName(name), pcx.fieldNameDef()),
+        ]),
+        pcx.fieldNameDef()
+      );
+      def = new ast.DimensionFieldDeclaration(
+        this.astAt(new ast.ExprIdReference(ref), pcx.fieldNameDef()),
+        name,
+        name
+      );
+    }
+    const isDefine = pcx.isDefine();
+    const notes = blockNotes
+      .concat(this.getNotes(pcx.tags()))
+      .concat(isDefine ? this.getIsNotes(isDefine) : []);
+    extendOwnAnnotation(def, {notes});
+    return this.astAt(def, pcx);
+  }
+
+  protected getTetheredMeasureDef(
+    pcx: parse.TetheredMeasureDefContext,
+    blockNotes: Note[]
+  ): ast.DateSpineTetherDecl {
+    const exprCx = pcx.fieldExpr(0);
+    const decl = new ast.MeasureFieldDeclaration(
+      this.getFieldExpr(exprCx),
+      getId(pcx.fieldNameDef()),
+      this.getSourceCode(exprCx)
+    );
+    const notes = blockNotes
+      .concat(this.getNotes(pcx.tags()))
+      .concat(this.getIsNotes(pcx.isDefine()));
+    extendOwnAnnotation(decl, {notes});
+    this.astAt(decl, pcx);
+    const ret: ast.DateSpineTetherDecl = {decl};
+    if (pcx._atKw && pcx._tetherAt) {
+      if (pcx._atKw.text.toLowerCase() !== 'at') {
+        this.contextError(
+          pcx._atKw,
+          'date-spine-expected-at',
+          `Expected 'at <date field>' after the measure, found '${pcx._atKw.text}'`
+        );
+      }
+      ret.at = this.getFieldExpr(pcx._tetherAt);
+    }
+    if (pcx._defaultKw && pcx._tetherDefault) {
+      if (pcx._defaultKw.text.toLowerCase() !== 'default') {
+        this.contextError(
+          pcx._defaultKw,
+          'date-spine-expected-default',
+          `Expected 'default <value>', found '${pcx._defaultKw.text}'`
+        );
+      }
+      ret.default = this.getFieldExpr(pcx._tetherDefault);
+    }
+    return ret;
+  }
+
+  visitDefDateSpineRange(
+    pcx: parse.DefDateSpineRangeContext
+  ): ast.DateSpineRange {
+    this.inExperiment('date_spine', pcx);
+    const expr = this.getFieldExpr(pcx.fieldExpr());
+    if (expr instanceof ast.Range) {
+      return this.astAt(new ast.DateSpineRange(expr.first, expr.last), pcx);
+    }
+    this.contextError(
+      pcx,
+      'date-spine-range-invalid',
+      'spine_range: needs a range, e.g. `spine_range: @2020-01-01 to @2026-12-31`'
+    );
+    return this.astAt(new ast.DateSpineRange(expr, expr), pcx);
+  }
+
   visitSQArrow(pcx: parse.SQArrowContext) {
     const applyTo = this.getSqExpr(pcx.sqExpr());
     const headCx = pcx.segExpr();
