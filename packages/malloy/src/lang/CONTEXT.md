@@ -177,6 +177,21 @@ Given resolution itself is split in two — distinct from the translator/compile
 
 For the compiler-side phase and the runtime supply pipeline, see [`../api/foundation/CONTEXT.md`](../api/foundation/CONTEXT.md).
 
+## date_spine sources (experimental, `##! experimental.date_spine`)
+
+`date_spine(a, b) extend { from a { dimension: …  measure: m is count() at a_date default 0 } }`
+puts measures from several sources, each tied to its own date column, on one generated date series.
+
+- **Definition** (`ast/source-elements/date-spine-source.ts`). `RefinedSource` hands the `from` blocks to `applyDateSpineMembers`.
+  - Each block's fields are compiled in the member's namespace. They are added to the member under internal names (`__ds_d_*`, `__ds_t_*`), so `c is c at d` is not a redefinition.
+  - The spine gets one plain column per shared dimension, and one placeholder measure (`node: 'dateSpineMeasure'`) per tethered measure.
+  - `at` and `default` are matched as plain identifiers, not keywords, so columns with those names stay legal.
+- **Resolution** (`date-spine-utils.ts`). This is a per-query rewrite. It runs in `QueryArrow` and `QueryRefine`, and only once stage 1 is final (`isPartialOk` false).
+  - The grain is the finest truncation of `dspine` in `group_by`.
+  - It builds one pre-aggregation `Query` per (member, tether date), grouped by exactly the query's keys, and pushes row-level filters into each of them.
+  - It rewrites stage 1 and stores the resolved def in `compositeResolvedSourceDef`. The resolved def carries `plan`.
+  - Tethered measures become `max(<pre-aggregated column>)`, which is exact because every output row matches exactly one spine row.
+
 ## Restricted mode
 
 `MalloyTranslator.restrictedMode` (boolean, default false) marks a compile as a *restricted query* — Malloy text submitted by an untrusted author against an already-loaded trusted model. The flag is set only by `ModelMaterializer.loadRestrictedQuery`; direct callers of `Malloy.compile` *could* pass `restrictedMode: true` on the request, but that is not a documented surface.
